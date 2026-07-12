@@ -1,0 +1,12 @@
+.venv
+ui/node_modules
+ui/dist
+exports
+backups
+.git
+.pytest_cache
+**/__pycache__
+*.pyc
+.playwright-mcp
+docs
+tests

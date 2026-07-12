@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "synapse": {
+      "command": "/path/to/synapse/.venv/bin/python",
+      "args": ["-m", "synapse.mcp.server"],
+      "env": {
+        "SYNAPSE_PROJECT_ID": "my-project",
+        "PYTHONPATH": "/path/to/synapse"
+      }
+    }
+  }
+}

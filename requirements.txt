@@ -1,0 +1,22 @@
+# Synapse backend dependencies (plan Part 10)
+# NOTE: create the venv with Python 3.12, NOT the system default 3.14.
+#   py -3.12 -m venv .venv
+# Versions are pinned during Phase 1 once compatibility is verified.
+
+graphiti-core          # Temporal knowledge graph engine (Apache-2.0)
+neo4j                  # Graph database driver
+fastapi                # API framework
+uvicorn[standard]      # ASGI server
+celery                 # Background curation tasks
+redis                  # Cache + Celery broker
+mcp                    # MCP SDK (agent interface)
+anthropic              # Claude API for entity extraction (Haiku)
+pydantic               # Schemas
+pydantic-settings      # Config loading
+
+# Dev / test
+pytest
+pytest-asyncio
+pytest-cov
+ruff
+mypy

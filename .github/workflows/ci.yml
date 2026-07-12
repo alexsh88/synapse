@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # backend: lint + test (Python 3.12, no live services needed — all fakes)
+  # ---------------------------------------------------------------------------
+  backend:
+    name: Backend (Python 3.12)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # Drop pywin32 — Windows-only wheel, no Linux distribution (same as Dockerfile line 15).
+      - name: Install dependencies
+        run: grep -ivE '^pywin32' requirements.txt > /tmp/reqs.txt && pip install -r /tmp/reqs.txt
+
+      - name: Lint (ruff)
+        run: ruff check synapse tests scripts
+
+      - name: Test (pytest)
+        run: pytest
+        env:
+          # Tests use fakes; no live Neo4j/Redis/Ollama/Anthropic needed.
+          # Dummy values so pydantic-settings doesn't error on missing env vars.
+          ANTHROPIC_API_KEY: "ci-fake"
+          NEO4J_PASSWORD: "ci-fake"
+
+  # ---------------------------------------------------------------------------
+  # frontend: build (Node 22, React+TS+Vite)
+  # ---------------------------------------------------------------------------
+  frontend:
+    name: Frontend (Node 22)
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ui
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build

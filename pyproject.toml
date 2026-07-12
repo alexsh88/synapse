@@ -1,0 +1,57 @@
+[project]
+name = "synapse"
+requires-python = ">=3.12"
+
+# ---------------------------------------------------------------------------
+# Ruff — lint configuration (no formatting; Black/isort not used here)
+# Rules are intentionally narrow so CI stays green on existing code.
+# Violations in source are scoped out via per-file-ignores rather than
+# patching source (per the CI spec).
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# E/F/W pycodestyle + pyflakes only — keeps the rule set minimal and fast.
+# E501 (line-too-long) is excluded: the codebase uses long lines throughout
+# (comments, data literals, Cypher strings) and fixing source is out of scope.
+select = ["E", "F", "W"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# scripts/ — smoke/integration scripts, not production code.
+# E402: late imports behind sys.path manipulation (ab_extract.py).
+# E741: short loop variables are fine in one-off scripts.
+# F541: bare f-strings in print calls (connect_projects_test.py).
+# F841: intentionally unused locals used for side-effects or debug.
+"scripts/*.py" = ["E402", "E741", "F541", "F841"]
+
+# synapse/api/deps.py — `Depends` imported for re-export / future use.
+"synapse/api/deps.py" = ["F401"]
+
+# synapse/core/retrieval_engine.py
+# E741: single-letter loop var `l` in list comprehensions (existing code).
+# F841: `n = len(facts)` retained for future readability; unused today.
+"synapse/core/retrieval_engine.py" = ["E741", "F841"]
+
+# synapse/core/session_capture.py
+# F841: `res` assigned for future logging; return value intentionally dropped.
+"synapse/core/session_capture.py" = ["F841"]
+
+# synapse/eval/runner.py — `math` import retained as documented stub.
+"synapse/eval/runner.py" = ["F401"]
+
+# synapse/models/api.py — re-export pattern: _QUEUE_MAXSIZE imported for
+# backward-compatible public alias; ruff flags F401 for the aliased import.
+"synapse/models/api.py" = ["F401"]
+
+# synapse/workers/curation_tasks.py — `import redis as _redis_types` is
+# guarded by TYPE_CHECKING; ruff's F401 doesn't understand the guard here.
+"synapse/workers/curation_tasks.py" = ["F401"]
+
+# tests/ — test helpers legitimately carry unused imports (pytest marker
+# imports, future-use fixtures, debug locals, compact one-liners).
+# E702: semicolons used for terse in-line setup (test_backup, test_project_connector).
+# F401: unused imports in test modules (pytest, typing helpers, etc.).
+# F841: unused locals that capture side-effect results for readability.
+"tests/*.py" = ["E702", "F401", "F841"]

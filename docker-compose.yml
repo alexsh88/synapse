@@ -1,0 +1,121 @@
+# Synapse — self-hosted infrastructure (plan Part 1, Part 7).
+# Host ports are remapped to avoid conflicts with other stacks that may be running
+# on the same machine; container-internal ports stay standard. See docs/readiness-check.md §2b.
+#
+#   cp .env.example .env   # then set NEO4J_PASSWORD
+#   docker compose up -d
+#   docker compose ps      # all three should be (healthy)
+
+name: synapse
+
+services:
+  neo4j:
+    image: neo4j:5-community
+    container_name: synapse-neo4j
+    restart: unless-stopped
+    ports:
+      - "7475:7474"   # HTTP / Neo4j Browser  -> http://localhost:7475
+      - "7688:7687"   # Bolt (driver / Graphiti)
+    environment:
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}"
+      NEO4J_PLUGINS: '["apoc"]'                       # Graphiti relies on APOC
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+      # Modest footprint for the MVP (adjust if the host has headroom; see readiness §3)
+      NEO4J_server_memory_heap_initial__size: "512m"
+      NEO4J_server_memory_heap_max__size: "1G"
+      NEO4J_server_memory_pagecache_size: "512m"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      # Bolt readiness via cypher-shell. Single-$ ${...} is interpolated by compose
+      # from .env at up-time, so the password is baked into the test string.
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p \"${NEO4J_PASSWORD}\" 'RETURN 1' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  # Qdrant removed: vectors live in Neo4j's native index via Graphiti (BGE-M3,
+  # 1024-dim). Redundant at Synapse's scale — see docs/research/qdrant-vs-neo4j-vectors.md.
+
+  redis:
+    image: redis:7-alpine
+    container_name: synapse-redis
+    restart: unless-stopped
+    ports:
+      - "6382:6379"   # Celery broker + brief cache
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # Synapse API — the FastAPI app. Reaches host Ollama via host.docker.internal (GPU stays on
+  # host); neo4j/redis over the compose network. The projects root is mounted so the "Connect
+  # project" feature can write wiring files into each project. `docker compose up -d` = whole stack.
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: synapse-api
+    restart: unless-stopped
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8848:8848"
+    env_file:
+      - .env
+    environment:
+      # Override the host-oriented .env values for the compose network (OS env > .env in pydantic).
+      NEO4J_URI: "bolt://neo4j:7687"          # compose-internal port, not the host-mapped 7688
+      REDIS_URL: "redis://redis:6379/0"
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434/v1"
+      PROJECTS_ROOT: "/projects"
+      EXTRACTION_MODE: "hybrid"          # gemma3:12b local (strict) -> Sonnet fallback (near-$0 writes)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ".:/app"                               # live code in dev (shadows the image's /app/synapse)
+      - "${SYNAPSE_PROJECTS_ROOT:-./projects-mount}:/projects"  # write wiring files (F2)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8848/api/v1/health', timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  # Synapse UI — the React/Vite app, built and served by nginx. Reverse-proxies /api and /ws
+  # to the api service (see ui/nginx.conf), so the browser only ever talks to this one origin.
+  # Host port 5174 (remapped; see docs/readiness-check.md §2b) -> http://localhost:5174
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    container_name: synapse-ui
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "5174:80"
+    healthcheck:
+      # 127.0.0.1 not localhost: alpine resolves localhost to IPv6 ::1 first, but nginx
+      # only binds IPv4 0.0.0.0:80, so localhost would be refused.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  redis_data:

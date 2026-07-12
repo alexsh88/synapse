@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Node / UI (later phases)
+node_modules/
+ui/dist/
+ui/.vite/
+
+# Docker volumes / data
+data/
+neo4j/
+qdrant_storage/
+*.dump
+
+# Generated artifacts (regenerable; not source)
+# exports/ = Obsidian mirror (scripts/export_obsidian.py); backups/ = curation snapshots
+exports/
+backups/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Playwright + verification screenshots
+.playwright-mcp/
+/synapse-*.png
+synapse-system-design.html
+
+# Private / machine-local project registry (contains personal paths)
+projects.json
+docker-compose.override.yml
+
+# Private eval cases (contain real project knowledge; not for public release)
+synapse/eval/cases_private.py
+
+# Eval baseline (may contain real project names / knowledge text)
+synapse/eval/baseline.json

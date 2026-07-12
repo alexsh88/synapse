@@ -1,0 +1,20 @@
+{
+  "acme-api": {
+    "name": "Acme API",
+    "path": "/home/user/dev/acme/acme-api",
+    "cluster": "backend",
+    "desc": "Acme API is a Python FastAPI service providing RESTful endpoints for the Acme platform, backed by PostgreSQL and Redis."
+  },
+  "acme-web": {
+    "name": "Acme Web",
+    "path": "/home/user/dev/acme/acme-web",
+    "cluster": "frontend",
+    "desc": "Acme Web is a React storefront for the Acme platform: TypeScript, Vite, Tailwind, with TanStack Query for server state."
+  },
+  "acme-infra": {
+    "name": "Acme Infra",
+    "path": "/home/user/dev/acme/acme-infra",
+    "cluster": "infra",
+    "desc": "Acme Infra is the Terraform + Kubernetes tooling for deploying the Acme platform on AWS EKS, with Helm charts and ArgoCD pipelines."
+  }
+}

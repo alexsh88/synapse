@@ -1,0 +1,63 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #0a0c10;
+  --color-surface: #13161c;
+  --color-surface-2: #1a1e26;
+  --color-line: #232832;
+  --color-text: #e6e8eb;
+  --color-muted: #8b919a;
+  --color-accent: #22d3ee;
+
+  --color-decision: #f5a623;
+  --color-convention: #2dd4bf;
+  --color-lesson: #f87171;
+  --color-research: #a78bfa;
+  --color-pattern: #4ade80;
+  --color-tool: #60a5fa;
+  --color-project: #22d3ee;
+  --color-entity: #8b919a;
+
+  --font-sans: "Inter Variable", "Inter", system-ui, sans-serif;
+  --font-display: "Newsreader Variable", "Newsreader", Georgia, serif;
+  --font-mono: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+}
+
+@layer base {
+  html, body, #root { height: 100%; }
+  body {
+    background: var(--color-bg);
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  ::selection { background: color-mix(in oklab, var(--color-accent) 28%, transparent); }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-line); border-radius: 9999px; border: 3px solid var(--color-bg);
+  }
+  ::-webkit-scrollbar-thumb:hover { background: #2c333f; }
+}
+
+/* Atmosphere — deep space with a faint cyan + violet glow, never flat. */
+.atmosphere {
+  background:
+    radial-gradient(1100px 560px at 50% -12%, color-mix(in oklab, var(--color-accent) 9%, transparent), transparent 62%),
+    radial-gradient(760px 520px at 110% 115%, color-mix(in oklab, #a78bfa 7%, transparent), transparent 60%),
+    var(--color-bg);
+}
+
+/* Faint grain overlay for texture/depth. */
+.grain::after {
+  content: ""; position: fixed; inset: 0; z-index: 60; pointer-events: none;
+  opacity: 0.04; mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+@keyframes breathe { 0%,100% { opacity: .55; transform: scale(1); } 50% { opacity: 1; transform: scale(1.35); } }
+.animate-breathe { animation: breathe 2.4s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; }
+}

@@ -103,10 +103,13 @@ async def _grade_anthropic(
     from anthropic import AsyncAnthropic
 
     client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+    # No `temperature`: newer Anthropic SDKs dropped it from the Messages signature, and passing
+    # it fails type-checking against them. Determinism here rests on the rubric being coarse
+    # (a single digit) and `max_tokens=8` leaving no room to wander, not on a sampling knob.
+    # The local judge below still sets it, because the OpenAI-compatible endpoint still takes it.
     msg = await client.messages.create(
         model=model or settings.triage_model,
         max_tokens=8,
-        temperature=0,
         system=rubric,
         messages=[{"role": "user", "content": f"{query}\n\n{fact}\n\nGrade:"}],
     )

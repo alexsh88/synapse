@@ -4,6 +4,10 @@
 # Versions are pinned during Phase 1 once compatibility is verified.
 
 graphiti-core          # Temporal knowledge graph engine (Apache-2.0)
+# graphiti-core imports httpx directly but does not declare it, and it used to arrive transitively
+# via starlette. Starlette has since moved to httpx2, so on a fresh resolve httpx disappears and
+# every graphiti import fails. Declared here because we depend on it, not because we chose it.
+httpx
 neo4j                  # Graph database driver
 fastapi                # API framework
 uvicorn[standard]      # ASGI server

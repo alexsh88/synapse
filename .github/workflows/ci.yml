@@ -20,11 +20,24 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: requirements.lock.txt
 
-      # Drop pywin32 — Windows-only wheel, no Linux distribution (same as Dockerfile line 15).
+      # Install the LOCK, not requirements.txt. requirements.txt is unpinned, so CI resolved
+      # whatever was newest while the working venv stayed months old, and the two drifted until a
+      # release exposed it — three times in one afternoon: anthropic dropped `temperature` from the
+      # Messages signature, starlette moved to httpx2 so httpx stopped arriving transitively, and
+      # the mcp SDK moved `mcp.server.fastmcp`. None were code defects; all three were the same
+      # missing pin. requirements.txt stays as the human-readable statement of intent.
+      #
+      # pywin32 is dropped — Windows-only wheel, no Linux distribution (same as the Dockerfile).
+      # ruff, mypy and pytest-cov are not in the lock (it freezes the runtime venv), so they are
+      # installed on top; they are linters, and a new version of one failing the build is a
+      # signal worth having rather than drift worth hiding.
       - name: Install dependencies
-        run: grep -ivE '^pywin32' requirements.txt > /tmp/reqs.txt && pip install -r /tmp/reqs.txt
+        run: |
+          grep -ivE '^pywin32' requirements.lock.txt > /tmp/locked.txt
+          pip install -r /tmp/locked.txt
+          pip install pytest-cov ruff mypy
 
       - name: Lint (ruff)
         run: ruff check synapse tests scripts

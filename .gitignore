@@ -19,6 +19,9 @@ htmlcov/
 node_modules/
 ui/dist/
 ui/.vite/
+# tsc -b writes this on every build, so a tracked copy shows up as a diff after `npm run build`
+# and reliably rides along in unrelated commits.
+ui/tsconfig.tsbuildinfo
 
 # Docker volumes / data
 data/
@@ -30,6 +33,11 @@ qdrant_storage/
 # exports/ = Obsidian mirror (scripts/export_obsidian.py); backups/ = curation snapshots
 exports/
 backups/
+
+# Agent worktrees — `Agent(isolation: "worktree")` checks a full copy of the repo out here.
+# They are throwaway scratch space, and while they exist every repo-wide grep/ripgrep returns
+# each hit three or four times over. Never committed; delete with `git worktree remove`.
+.claude/worktrees/
 
 # OS / editor
 .DS_Store
@@ -51,3 +59,25 @@ synapse/eval/cases_private.py
 
 # Eval baseline (may contain real project names / knowledge text)
 synapse/eval/baseline.json
+
+# Held-out eval set built by scripts/build_heldout_set.py. Holds real queries mined from the
+# query log and the fact text they retrieved — strictly more sensitive than the baseline above.
+synapse/eval/heldout.json
+
+# Human labelling files from scripts/validate_invalidation_guard.py --export. They quote real
+# fact text from the corpus, and the .key.json holds the verdicts the labeller must not see.
+invalidation-labels*.md
+invalidation-labels*.key.json
+
+# Career / positioning notes. These are about the AUTHOR, not the software, and a repository that
+# ships its own resume bullets reads as a project built to serve a CV rather than the reverse. The
+# comment draft is the pointed one: it reasons about how to pitch a contribution inside another
+# project's issue tracker, and while the decision it reached was the generous one, nobody upstream
+# should have to read the deliberation. Kept on disk, out of both repositories.
+docs/research/portfolio-strategy-*.md
+docs/research/resume-and-interview.md
+docs/research/graphiti-*-comment-draft.md
+
+# Redaction inputs for scripts/redact_corpus_identifiers.py — this file holds the very
+# identifiers that script removes from the graph, so it must never be committed.
+redaction-needles.json

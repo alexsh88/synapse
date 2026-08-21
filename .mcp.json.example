@@ -1,11 +1,12 @@
 {
+  "_comment": "Copy this into each connected project's .mcp.json. Set SYNAPSE_PROJECT_ID to that project's id (see docs/synapse-projects.md). The server reads Neo4j/Ollama/Anthropic config from Synapse's own .env via an absolute path, so no creds are needed here.",
   "mcpServers": {
     "synapse": {
-      "command": "/path/to/synapse/.venv/bin/python",
+      "command": "/path/to/dev/projects/synapse/.venv/Scripts/python.exe",
       "args": ["-m", "synapse.mcp.server"],
       "env": {
-        "SYNAPSE_PROJECT_ID": "my-project",
-        "PYTHONPATH": "/path/to/synapse"
+        "SYNAPSE_PROJECT_ID": "acme-store",
+        "PYTHONPATH": "/path/to/dev/projects/synapse"
       }
     }
   }

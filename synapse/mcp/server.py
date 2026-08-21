@@ -27,6 +27,11 @@ logger = logging.getLogger("synapse.mcp")
 # Scope resolution: the project this server instance speaks for (None => global-only).
 PROJECT_ID = os.environ.get("SYNAPSE_PROJECT_ID") or None
 
+# Write attribution (roadmap item 13). This process exists to serve Claude Code over MCP, so it can
+# name the writer without being told. setdefault, not assignment: a project's .mcp.json or the shell
+# may already have set something more specific, and that should win.
+os.environ.setdefault("SYNAPSE_AGENT", "claude-code")
+
 # Single connected engine for the process (set in lifespan).
 _engine: KnowledgeEngine | None = None
 
@@ -102,6 +107,38 @@ async def brief(project_id: str | None = None) -> dict:
     Call this at the start of a session. Defaults to this project (SYNAPSE_PROJECT_ID).
     """
     return await _safe(t.brief(_engine, PROJECT_ID, project_id=project_id))
+
+
+@mcp.tool()
+async def remember_runbook(
+    name: str, steps: list[str], purpose: str | None = None,
+    prerequisites: str | None = None, scope: str | None = None, verified: bool = True,
+) -> dict:
+    """Store an ordered, executable procedure — "how to do X here".
+
+    Use this instead of remember() whenever the knowledge is a SEQUENCE: a deploy runbook, a
+    debugging procedure, a pre-release checklist, the steps to wire a new service. remember()
+    takes prose and extracts entities from it, which loses the ordering; this keeps the steps
+    exactly as given.
+
+    `steps` is an ordered list, one action per item. Set verified=false if you are recording a
+    procedure you have not just run yourself.
+    """
+    return await _safe(t.remember_runbook(
+        _engine, PROJECT_ID, name, steps, purpose=purpose,
+        prerequisites=prerequisites, scope=scope, verified=verified,
+    ))
+
+
+@mcp.tool()
+async def runbooks(project_id: str | None = None, limit: int = 20) -> dict:
+    """List the procedures available to this project, with their steps.
+
+    Call before doing anything operational (deploying, releasing, debugging a recurring failure)
+    — the sequence may already be written down. Results marked stale have not been verified
+    recently; treat their steps as a starting point, then re-store them with verified=true.
+    """
+    return await _safe(t.runbooks(_engine, PROJECT_ID, project_id=project_id, limit=limit))
 
 
 @mcp.tool()

@@ -29,6 +29,11 @@ jobs:
       - name: Lint (ruff)
         run: ruff check synapse tests scripts
 
+      # Config in pyproject.toml [tool.mypy]; scoped to synapse/ and clean, so a new
+      # type error fails the build rather than accumulating.
+      - name: Type-check (mypy)
+        run: mypy
+
       - name: Test (pytest)
         run: pytest
         env:

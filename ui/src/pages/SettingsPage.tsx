@@ -20,10 +20,25 @@ export default function SettingsPage() {
           </div>
         ))}
       </div>
-      <p className="mt-7 max-w-2xl text-sm leading-relaxed text-muted">
-        Embedder configuration, curation schedule, and backup/export controls arrive with the
-        curation engine in Phases 9–10.
-      </p>
+      <h2 className="mt-8 font-display text-lg text-text">Where the controls live</h2>
+      <div className="mt-3 max-w-2xl space-y-2 text-sm leading-relaxed text-muted">
+        <p>
+          <span className="text-text">Curation</span> — graph health, duplicate clusters and
+          consolidation proposals are on the <span className="font-mono text-xs">Curate</span> page.
+          They run nightly in the <span className="font-mono text-xs">beat</span> container and are
+          proposal-only: nothing mutates the graph on a timer.
+        </p>
+        <p>
+          <span className="text-text">Embedder and extraction mode</span> — set by environment
+          (<span className="font-mono text-xs">EXTRACTION_MODE</span>), not from the UI. The
+          embedding dimension is locked at first ingestion, so changing it is a re-embedding
+          migration rather than a setting.
+        </p>
+        <p>
+          <span className="text-text">Backup and export</span> — CLI only, deliberately: they are
+          destructive-adjacent and belong next to a terminal where the output can be read.
+        </p>
+      </div>
     </div>
   );
 }

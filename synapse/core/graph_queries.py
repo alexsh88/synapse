@@ -10,6 +10,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from synapse.core.feedback import FactFeedback, FeedbackSummary
+
 # Typed knowledge labels (for timeline / project counts).
 _KNOWLEDGE_LABELS = ["Decision", "Convention", "Lesson", "Research", "Pattern", "Tool"]
 
@@ -80,6 +82,20 @@ class SupersededItem(BaseModel):
     invalid_at: datetime | None = None
 
 
+class ProvenanceGroup(BaseModel):
+    """What one writer (or one session) taught Synapse, and how far it spread."""
+
+    agent: str | None = None
+    session_id: str | None = None
+    model: str | None = None
+    host: str | None = None
+    episodes: int = 0
+    derived_facts: int = 0          # fact edges extracted from those episodes — the blast radius
+    scopes: list[str] = Field(default_factory=list)
+    first_write: datetime | None = None
+    last_write: datetime | None = None
+
+
 class CurationHealth(BaseModel):
     total_nodes: int = 0
     active_edges: int = 0
@@ -104,6 +120,127 @@ def _native(value):
 class GraphService:
     def __init__(self, graphiti) -> None:
         self._driver = graphiti.driver
+
+    async def feedback(self, *, limit: int = 15) -> FeedbackSummary:
+        """What retrieval is actually delivering (roadmap item 14).
+
+        ``coverage`` is the headline number: the fraction of the corpus that has ever been served to
+        a consumer. A large graph with low coverage is mostly write-only — knowledge nobody reads.
+
+        ``suspect`` lists facts that were explicitly corrected (``update``/``forget``), which is the
+        strongest quality signal available. Note there is deliberately no "was it used" figure — see
+        synapse/core/feedback.py for why inventing one would be worse than having none.
+        """
+        # Impressions and coverage describe the ACTIVE corpus — what retrieval can currently serve.
+        totals = await self._driver.execute_query(
+            """
+            MATCH ()-[e:RELATES_TO]->()
+            WHERE e.invalid_at IS NULL AND coalesce(e.archived, false) = false
+            RETURN count(e) AS total,
+                   sum(CASE WHEN coalesce(e.recalled_n, 0) > 0 THEN 1 ELSE 0 END) AS ever,
+                   sum(coalesce(e.recalled_n, 0)) AS impressions
+            """
+        )
+        row = totals.records[0] if totals.records else None
+        total = int(row["total"]) if row else 0
+        ever = int(row["ever"]) if row else 0
+
+        # Corrections are counted over ALL edges, deliberately NOT just the active ones. A
+        # correction (`update`/`forget`) *deactivates* the fact it corrects, so restricting this to
+        # active edges made it structurally ~0 — caught live, where corrected_facts read 0 while the
+        # suspect list below showed a corrected fact.
+        corrected_res = await self._driver.execute_query(
+            """
+            MATCH ()-[e:RELATES_TO]->() WHERE coalesce(e.corrected_n, 0) > 0
+            RETURN count(e) AS corrected
+            """
+        )
+        corrected = int(corrected_res.records[0]["corrected"]) if corrected_res.records else 0
+
+        top = await self._driver.execute_query(
+            """
+            MATCH ()-[e:RELATES_TO]->() WHERE coalesce(e.recalled_n, 0) > 0
+            RETURN e.uuid AS uuid, e.fact AS fact, e.group_id AS scope,
+                   coalesce(e.recalled_n, 0) AS recalled_n, coalesce(e.corrected_n, 0) AS corrected_n
+            ORDER BY recalled_n DESC LIMIT $limit
+            """,
+            limit=limit,
+        )
+        bad = await self._driver.execute_query(
+            """
+            MATCH ()-[e:RELATES_TO]->() WHERE coalesce(e.corrected_n, 0) > 0
+            RETURN e.uuid AS uuid, e.fact AS fact, e.group_id AS scope,
+                   coalesce(e.recalled_n, 0) AS recalled_n, coalesce(e.corrected_n, 0) AS corrected_n
+            ORDER BY corrected_n DESC LIMIT $limit
+            """,
+            limit=limit,
+        )
+
+        def rows(result):
+            return [
+                FactFeedback(
+                    uuid=r["uuid"], fact=r["fact"] or "", scope=r["scope"] or "",
+                    recalled_n=int(r["recalled_n"]), corrected_n=int(r["corrected_n"]),
+                )
+                for r in result.records
+            ]
+
+        return FeedbackSummary(
+            total_facts=total,
+            ever_recalled=ever,
+            never_recalled=max(0, total - ever),
+            total_impressions=int(row["impressions"]) if row else 0,
+            corrected_facts=corrected,
+            most_recalled=rows(top),
+            suspect=rows(bad),
+        )
+
+    async def provenance(
+        self, *, session_id: str | None = None, agent: str | None = None, limit: int = 50,
+    ) -> list[ProvenanceGroup]:
+        """Group stored knowledge by who wrote it — the blast-radius query (roadmap item 13).
+
+        Answers "what did this session teach us?" by joining episodes to the fact edges extracted
+        from them. Every edge carries an ``episodes`` list (3,030 of 3,030 on the live graph), so
+        the derived-fact count is exact rather than an estimate.
+
+        Filtering by ``session_id`` narrows it to one session, which is what makes a bad write
+        reversible: the returned scopes and counts tell you exactly what a rollback would touch.
+        Episodes with no provenance (everything written before item 13) group under nulls, so the
+        gap is visible rather than hidden.
+        """
+        filters = ["1=1"]
+        params: dict = {"limit": limit}
+        if session_id:
+            filters.append("ep.prov_session_id = $session_id")
+            params["session_id"] = session_id
+        if agent:
+            filters.append("ep.prov_agent = $agent")
+            params["agent"] = agent
+        result = await self._driver.execute_query(
+            f"""
+            MATCH (ep:Episodic) WHERE {" AND ".join(filters)}
+            OPTIONAL MATCH ()-[e:RELATES_TO]->() WHERE ep.uuid IN coalesce(e.episodes, [])
+            WITH ep.prov_agent AS agent, ep.prov_session_id AS session_id,
+                 ep.prov_model AS model, ep.prov_host AS host,
+                 count(DISTINCT ep) AS episodes, count(DISTINCT e) AS derived_facts,
+                 collect(DISTINCT ep.group_id) AS scopes,
+                 min(ep.created_at) AS first_write, max(ep.created_at) AS last_write
+            RETURN agent, session_id, model, host, episodes, derived_facts, scopes,
+                   first_write, last_write
+            ORDER BY last_write DESC LIMIT $limit
+            """,
+            **params,
+        )
+        return [
+            ProvenanceGroup(
+                agent=r["agent"], session_id=r["session_id"], model=r["model"], host=r["host"],
+                episodes=int(r["episodes"]), derived_facts=int(r["derived_facts"]),
+                scopes=sorted(x for x in (r["scopes"] or []) if x),
+                first_write=_native(r["first_write"]), last_write=_native(r["last_write"]),
+            )
+            for r in result.records
+        ]
 
     async def snapshot(
         self, scopes: list[str], types: list[str] | None = None,

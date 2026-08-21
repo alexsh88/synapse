@@ -83,3 +83,34 @@ async def _scan_health() -> dict:
         return {"total_nodes": health.total_nodes, "superseded_edges": health.superseded_edges}
     finally:
         await graphiti.close()
+
+
+@celery_app.task(name="synapse.curation.consolidate")
+def consolidate() -> dict:
+    """Nightly consolidation pass (research Wave 2) — PROPOSE ONLY, never mutates knowledge.
+
+    Runs after the suggestion/health scans so it sees a fresh duplicate analysis. Everything it
+    produces lands in the review inbox (``GET /api/v1/curation/proposals``); nothing is applied
+    without a human. Uses no cloud LLM, so it costs nothing to run every night.
+    """
+    return asyncio.run(_consolidate())
+
+
+async def _consolidate() -> dict:
+    from synapse.core.consolidation_engine import build_consolidation_engine
+
+    graphiti = build_graphiti()
+    try:
+        # No `remember` wired here on purpose: the worker must not be able to write knowledge.
+        # Applying a promotion is a human action through the API, which has the write path.
+        engine = build_consolidation_engine(graphiti)
+        run = await engine.propose()
+        summary = {
+            "merges_proposed": run.merges_proposed,
+            "promotions_proposed": run.promotions_proposed,
+            "already_known": run.already_known,
+        }
+        logger.info("consolidation pass: %s", summary)
+        return summary
+    finally:
+        await graphiti.close()

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import TYPE_CHECKING, TypeVar
 
 from openai import AsyncOpenAI
 
@@ -29,7 +30,32 @@ from graphiti_core.llm_client.config import LLMConfig
 
 from synapse.config import settings
 
+# Type-only: the runtime imports stay inside connect() because write_pipeline imports THIS
+# module, and a top-level import would close the cycle. TYPE_CHECKING never executes.
+if TYPE_CHECKING:
+    from synapse.core.consolidation_engine import ConsolidationEngine
+    from synapse.core.curation_engine import CurationEngine
+    from synapse.core.graph_queries import GraphService
+    from synapse.core.retrieval_engine import RetrievalEngine
+    from synapse.core.session_capture import CaptureEngine
+    from synapse.core.write_pipeline import WritePipeline
+
 logger = logging.getLogger("synapse.engine")
+
+_C = TypeVar("_C")
+
+
+def _require(component: _C | None, name: str) -> _C:
+    """Return a component built by ``connect()``, or say plainly that connect() was skipped.
+
+    Without this the failure is ``AttributeError: 'NoneType' object has no attribute 'remember'``
+    from somewhere deep in a request, which names neither the component nor the missing step.
+    """
+    if component is None:
+        raise RuntimeError(
+            f"KnowledgeEngine.{name} is not available — `await engine.connect()` was never called"
+        )
+    return component
 
 # Ollama's OpenAI-compatible endpoint comes from settings.ollama_base_url (host default
 # 127.0.0.1; the dockerized API overrides to host.docker.internal). The api_key is required
@@ -106,6 +132,10 @@ class RetryingOpenAIEmbedder(OpenAIEmbedder):
                 preview = repr(arg)[:120]
                 logger.warning("embedder attempt %d/%d failed (%s); input=%s", attempt + 1, n, exc, preview)
                 await asyncio.sleep(0.5 * (attempt + 1))
+        # attempts <= 0 is a misconfigured caller, not a transient embedder failure. Without this
+        # guard the loop never runs and `raise last` raises None, masking the real mistake.
+        if last is None:
+            raise RuntimeError(f"embedder retry ran zero attempts (attempts={n})")
         raise last
 
 
@@ -165,11 +195,15 @@ class KnowledgeEngine:
     def __init__(self, graphiti: Graphiti | None = None, *, redis=None) -> None:
         self.graphiti = graphiti or build_graphiti()
         self._redis = redis
-        self.writer = None
-        self.reader = None
-        self.graph = None  # GraphService — set in connect()
-        self.curation = None  # CurationEngine — set in connect()
-        self.capture = None  # CaptureEngine — set in connect()
+        # All six are built by connect(); until then they are None and every use site goes
+        # through _require(), so "used before connect()" fails with that sentence instead of
+        # an AttributeError on None.
+        self.writer: WritePipeline | None = None
+        self.reader: RetrievalEngine | None = None
+        self.graph: GraphService | None = None
+        self.curation: CurationEngine | None = None
+        self.capture: CaptureEngine | None = None
+        self.consolidation: ConsolidationEngine | None = None
 
     async def connect(self) -> "KnowledgeEngine":
         # Lazy imports avoid a circular dependency (write_pipeline imports this module).
@@ -185,27 +219,113 @@ class KnowledgeEngine:
         self.curation = build_curation_engine(self.graphiti)
         from synapse.core.session_capture import build_capture_engine
         self.capture = build_capture_engine(self.graphiti, self.remember)
+        # Consolidation gets self.remember (not the raw pipeline) so an applied promotion goes
+        # through triage, credential redaction, dedup AND busts the affected brief cache.
+        from synapse.core.consolidation_engine import build_consolidation_engine
+        self.consolidation = build_consolidation_engine(self.graphiti, remember=self.remember)
         return self
 
     async def remember(self, content: str, **kwargs):
-        result = await self.writer.remember(content, **kwargs)
+        # Attribute every write, from every path (MCP, API, capture, seed, replay, consolidation),
+        # at ONE place. Provenance can only be captured at write time — see
+        # synapse/core/provenance.py — so a caller that forgets to pass it must not produce an
+        # anonymous write. An explicit value always wins.
+        from synapse.core.provenance import resolve as resolve_provenance
+
+        if kwargs.get("provenance") is None:
+            kwargs["provenance"] = resolve_provenance()
+        result = await _require(self.writer, "writer").remember(content, **kwargs)
         # Keep briefs fresh: a real write to a project busts that project's brief cache.
         if result.scope and result.scope.startswith("project_") and result.outcome.value in (
             "stored",
             "contradiction",
         ):
-            await self.reader.invalidate_brief(result.scope.removeprefix("project_"))
+            await _require(self.reader, "reader").invalidate_brief(
+                result.scope.removeprefix("project_")
+            )
         return result
 
+    async def remember_runbook(
+        self,
+        name: str,
+        steps: list[str],
+        *,
+        project_id: str | None = None,
+        cluster: str | None = None,
+        purpose: str | None = None,
+        prerequisites: str | None = None,
+        verified_at=None,
+    ):
+        """Store an ordered procedure (roadmap item 18).
+
+        Two writes, deliberately, because they serve different masters:
+
+        1. **The prose episode**, through the normal ``remember`` path — triage, credential
+           redaction, dedup, provenance. This is what makes the runbook reachable by ``recall()``,
+           which searches fact edges. Extraction will mangle the step order in this copy and that
+           is expected; it is the index, not the source of truth.
+        2. **The structured node**, via :class:`~synapse.core.runbooks.RunbookStore`. Ordered
+           steps written as a property, with no model in the path that could reorder them.
+
+        The prose goes first so that step 2 usually *adopts* the entity node extraction just
+        created, leaving one node that is both connected to the graph and structurally correct.
+
+        Returns the :class:`~synapse.core.runbooks.RunbookRecord`. A failure in the prose write is
+        logged and swallowed — losing searchability is bad, losing the procedure is worse.
+        """
+        from synapse.core.runbooks import RunbookStore, normalize_steps, runbook_prose
+        from synapse.core.schema import Scope
+
+        steps = normalize_steps(steps)
+        # Scope precedence matches the write pipeline's: cluster > project > global.
+        if cluster:
+            target = Scope.cluster(cluster)
+        elif project_id:
+            target = Scope.project(project_id)
+        else:
+            target = Scope.GLOBAL
+
+        try:
+            await self.remember(
+                runbook_prose(name, steps, purpose, prerequisites),
+                project_id=project_id,
+                cluster=cluster,
+                source="runbook",
+            )
+        except Exception:  # noqa: BLE001 — the index is best-effort; the procedure is not
+            logger.warning(
+                "runbook %r: prose episode failed, storing the structured node anyway "
+                "(recall() will not surface it until it is rewritten)", name, exc_info=True,
+            )
+
+        record = await RunbookStore(self.graphiti).upsert(
+            name=name, scope=target, steps=steps, purpose=purpose,
+            prerequisites=prerequisites, verified_at=verified_at,
+        )
+        if target.startswith("project_"):
+            await _require(self.reader, "reader").invalidate_brief(target.removeprefix("project_"))
+        return record
+
+    async def runbooks(self, project_id: str | None = None, *, limit: int = 20):
+        """Runbooks visible from *project_id*'s seat (global + cluster + project)."""
+        from synapse.core.runbooks import RunbookStore
+        from synapse.core.schema import Scope
+
+        cluster = self.reader._cluster_for(project_id) if self.reader else None
+        scopes = Scope.compose(project_id, cluster=cluster) if project_id else [Scope.GLOBAL]
+        return await RunbookStore(self.graphiti).list_for_scopes(scopes, limit=limit)
+
     async def recall(self, query: str, **kwargs):
-        return await self.reader.recall(query, **kwargs)
+        return await _require(self.reader, "reader").recall(query, **kwargs)
 
     async def brief(self, project_id: str, **kwargs):
-        return await self.reader.brief(project_id, **kwargs)
+        return await _require(self.reader, "reader").brief(project_id, **kwargs)
 
     async def search(self, query: str, *, group_ids=None, limit: int = 10, as_of=None):
         """Search across all knowledge (group_ids=None) or a specific scope set."""
-        return await self.reader.search(query, group_ids=group_ids, limit=limit, as_of=as_of)
+        return await _require(self.reader, "reader").search(
+            query, group_ids=group_ids, limit=limit, as_of=as_of
+        )
 
     async def relate(self, from_id: str, to_id: str, relationship_type: str) -> dict:
         """Manually link two entity nodes with a typed edge.
@@ -243,7 +363,12 @@ class KnowledgeEngine:
             MATCH ()-[e:RELATES_TO {uuid: $id}]->()
             SET e.invalid_at = coalesce(e.invalid_at, datetime()),
                 e.expired_at = coalesce(e.expired_at, datetime()),
-                e.forget_reason = coalesce(e.forget_reason, $reason)
+                e.forget_reason = coalesce(e.forget_reason, $reason),
+                // Retrieval feedback (roadmap item 14): forgetting a fact is an explicit judgement
+                // that it was wrong — the strongest quality signal available, and far more
+                // trustworthy than any inference about whether a recalled fact was "used".
+                e.corrected_n = coalesce(e.corrected_n, 0) + 1,
+                e.last_corrected_at = datetime()
             RETURN e.uuid AS uuid
             """,
             id=knowledge_id, reason=reason or "forgotten",

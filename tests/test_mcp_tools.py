@@ -22,15 +22,18 @@ class FakeEngine:
     def __init__(self):
         self.calls: list[tuple] = []
 
-    async def remember(self, content, *, knowledge_type=None, project_id=None, force=False):
-        self.calls.append(("remember", content, knowledge_type, project_id))
+    async def remember(self, content, *, knowledge_type=None, project_id=None, cluster=None,
+                       force=False):
+        self.calls.append(("remember", content, knowledge_type, project_id, cluster))
         return WriteResult(
             outcome=Outcome.STORED, knowledge_type=knowledge_type or "decision",
-            scope="global" if project_id is None else f"project_{project_id}",
+            scope=(f"cluster_{cluster}" if cluster
+                   else "global" if project_id is None else f"project_{project_id}"),
             episode_uuid="ep-1", entities=["Acme-Store"], facts=["Acme-Store uses X"],
         )
 
-    async def recall(self, query, *, project_id=None, limit=10, as_of=None):
+    async def recall(self, query, *, project_id=None, limit=10, as_of=None,
+                     feedback=False, **kw):
         self.calls.append(("recall", query, project_id, limit, as_of))
         return [Recalled(fact="a fact", score=0.9, scope="project_acme-store", uuid="u1")]
 
@@ -65,14 +68,14 @@ class FakeEngine:
 async def test_remember_defaults_to_project_scope():
     eng = FakeEngine()
     out = await t.remember(eng, DEFAULT_PROJECT, "we chose X")
-    assert eng.calls[0] == ("remember", "we chose X", None, "acme-store")
+    assert eng.calls[0] == ("remember", "we chose X", None, "acme-store", None)
     assert out["outcome"] == "stored" and out["scope"] == "project_acme-store"
 
 
 async def test_remember_global_scope_and_type():
     eng = FakeEngine()
     out = await t.remember(eng, DEFAULT_PROJECT, "universal rule", type="convention", scope="global")
-    assert eng.calls[0] == ("remember", "universal rule", "convention", None)
+    assert eng.calls[0] == ("remember", "universal rule", "convention", None, None)
     assert out["scope"] == "global"
 
 
@@ -157,8 +160,15 @@ async def test_update_passes_default_project():
 # --- server registration -----------------------------------------------------
 
 
-async def test_server_registers_all_seven_tools():
+async def test_server_registers_the_full_tool_surface():
     from synapse.mcp.server import mcp
 
     names = {tool.name for tool in await mcp.list_tools()}
-    assert names == {"remember", "recall", "brief", "search", "relate", "forget", "update"}
+    # remember_runbook / runbooks are separate tools rather than a `type="runbook"` flag on
+    # remember, because they take a different SHAPE of input: an ordered list instead of prose.
+    # Folding them into remember would mean accepting prose and hoping extraction preserved the
+    # ordering, which is the defect roadmap item 18 exists to fix.
+    assert names == {
+        "remember", "recall", "brief", "search", "relate", "forget", "update",
+        "remember_runbook", "runbooks",
+    }

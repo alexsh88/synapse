@@ -8,8 +8,28 @@ requires-python = ">=3.12"
 # Violations in source are scoped out via per-file-ignores rather than
 # patching source (per the CI spec).
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# mypy — type checking over the package (not tests/ or scripts/)
+# Scoped to `synapse/` on purpose: the tests lean on duck-typed Protocol fakes and the
+# scripts are one-off operational tools, so checking them would buy noise, not safety.
+# `ignore_missing_imports` is required — graphiti-core, neo4j and celery ship no stubs.
+# Clean as of 2026-08-19; enforced by CI, so it stays that way.
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+files = ["synapse"]
+ignore_missing_imports = true
+
 [tool.ruff]
 line-length = 100
+
+# Agent worktrees are full checkouts of this repo under `.claude/worktrees/`, so a bare
+# `ruff check .` would lint every abandoned one AND the live tree — reporting the same file
+# many times over, plus whatever half-finished state an agent left behind. (Discovered
+# 2026-07-27: ~30KB of E402/F841/F541 from three stale worktrees, none of it project source.)
+# Excluding them here means `ruff check .` and `ruff check synapse scripts tests` agree, so
+# nobody has to remember the scoped form.
+extend-exclude = [".claude"]
 
 [tool.ruff.lint]
 # E/F/W pycodestyle + pyflakes only — keeps the rule set minimal and fast.

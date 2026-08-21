@@ -98,17 +98,31 @@ class FakeCapture:
         return {"ok": True}
 
 
+class FakeReader:
+    def __init__(self):
+        self.invalidated: list[str] = []
+
+    async def invalidate_brief(self, project_id):
+        self.invalidated.append(project_id)
+
+
 class FakeEngine:
     def __init__(self):
         self.graph = FakeGraph()
         self.curation = FakeCuration()
         self.capture = FakeCapture()
+        self.reader = FakeReader()
         self.calls: list = []
+        self.fail_remember = False
 
         self._missing_ids: set[str] = set()
 
-    async def remember(self, content, *, knowledge_type=None, project_id=None, force=False):
+    async def remember(self, content, *, knowledge_type=None, project_id=None, force=False,
+                       provenance=None, **kw):
         self.calls.append(("remember", content, project_id))
+        self.last_provenance = provenance
+        if self.fail_remember:
+            raise RuntimeError("extraction boom")
         return WriteResult(outcome=Outcome.STORED, knowledge_type="decision",
                            scope="global" if project_id is None else f"project_{project_id}",
                            episode_uuid="ep1", facts=["a fact"])
@@ -129,7 +143,8 @@ class FakeEngine:
         self.calls.append(("search", q, group_ids))
         return [Recalled(fact="sf", score=0.9, scope="global", uuid="u1")]
 
-    async def recall(self, q, *, project_id=None, limit=10, as_of=None):
+    async def recall(self, q, *, project_id=None, limit=10, as_of=None,
+                     feedback=False, **kw):
         self.calls.append(("recall", q, project_id))
         return [Recalled(fact="rf", score=0.8, scope="global", uuid="u2")]
 
@@ -205,6 +220,150 @@ def test_connect_requires_path_for_unregistered(client_engine):
 def test_connect_status_unknown_job_404(client_engine):
     client, _ = client_engine
     assert client.get("/api/v1/projects/connect/nope").status_code == 404
+
+
+# --- the connect SUCCESS path (2026-07-30) ------------------------------------------------
+#
+# Only the two rejection paths above were covered, so an endpoint that could never return 2xx
+# shipped unnoticed. A real connect of a new project failed with a browser-visible 504 and left
+# these two faults in the log:
+#
+#   1. `entity` was typed `dict | None` but holds the write OUTCOME string ("stored"), so every
+#      successful connect died in response validation. The UI has always rendered it as text
+#      (`Project entity: {job.entity}`) and the TS type has always said `entity?: string`, so the
+#      string is the contract and the pydantic model was the odd one out.
+#   2. The Project-entity write ran INLINE in the request. It is an LLM extraction: measured at
+#      73s (wiring files written 09:45:08, handler reached its return at 09:46:22), which blew
+#      nginx's default 60s proxy_read_timeout. The browser got a 504 while the work went on to
+#      succeed in the background — the worst possible outcome, a false failure.
+
+
+@pytest.fixture
+def connectable(monkeypatch, tmp_path):
+    """A real project folder under a throwaway projects_root.
+
+    projects_root drives BOTH folder resolution and the connected-projects overlay that
+    `add_connected` persists to, so pointing it at tmp keeps this test off the real registry.
+    """
+    from synapse.core import registry
+    monkeypatch.setattr(settings, "projects_root", str(tmp_path))
+    monkeypatch.setattr(registry, "PROJECTS", {})
+    folder = tmp_path / "demo-project"
+    folder.mkdir()
+    return str(folder)
+
+
+def _settled(client, job: dict, tries: int = 50) -> dict:
+    """Poll until the background seed finishes — TestClient drives it on the same event loop."""
+    for _ in range(tries):
+        if job["state"] != "running":
+            return job
+        job = client.get(f"/api/v1/projects/connect/{job['job_id']}").json()
+    raise AssertionError(f"job never settled: {job}")
+
+
+def test_connect_returns_a_job_that_matches_its_response_model(client_engine, connectable):
+    client, engine = client_engine
+    r = client.post("/api/v1/projects/connect",
+                    json={"id": "demo-project", "path": connectable, "deep_seed": False})
+    assert r.status_code == 200, r.text          # was 500: entity typed dict, given "stored"
+    job = _settled(client, r.json())
+    assert job["state"] == "done" and job["entity"] == "stored"
+    assert job["actions"], "the wiring actions belong in the response"
+    assert engine.reader.invalidated == ["demo-project"], "a new project's brief must be dropped"
+
+
+def test_connect_answers_before_the_seed_write_runs(client_engine, connectable):
+    """Proven by making the write FAIL: inline it would 5xx the request; deferred, the request
+    succeeds at filesystem speed and the JOB carries the failure."""
+    client, engine = client_engine
+    engine.fail_remember = True
+    r = client.post("/api/v1/projects/connect",
+                    json={"id": "demo-project", "path": connectable, "deep_seed": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["state"] == "running", "no graph write may happen inside the request"
+    job = _settled(client, r.json())
+    assert job["state"] == "error" and "boom" in job["error"]
+
+
+def test_a_deep_seed_still_reports_its_chunk_progress(client_engine, connectable, tmp_path):
+    (tmp_path / "demo-project" / "README.md").write_text(
+        "\n\n".join(f"Paragraph {i} of the project readme, long enough to clear the 80-character "
+                    f"floor that the chunker applies to skip noise." for i in range(3)),
+        encoding="utf-8")
+    client, engine = client_engine
+    r = client.post("/api/v1/projects/connect",
+                    json={"id": "demo-project", "path": connectable, "deep_seed": True})
+    assert r.status_code == 200, r.text
+    job = _settled(client, r.json())
+    assert job["state"] == "done" and job["entity"] == "stored"
+
+    seeded = [content for kind, content, _ in engine.calls if kind == "remember"]
+    assert sum("of the project readme" in c for c in seeded) == 3
+    assert job["total"] == len(seeded) - 1 and job["stored"] == job["total"]  # -1: the entity write
+    # Exactly the README's 3 — write_files also creates a CLAUDE.md, but it holds only Synapse's
+    # own block and _chunks now strips that rather than seeding our boilerplate as project
+    # knowledge. Guards the loop where the connector feeds its own output back in.
+    assert job["total"] == 3
+
+
+# --- connecting a project that lives outside the primary root (2026-07-31) ----------------
+#
+# Reported as `project folder not found: /projects/acme-mobile` for a folder that
+# existed at C:\Users\dev\acme-mobile. Resolution keeps only the folder NAME — the
+# container reaches host directories through bind mounts, so a host path must be re-rooted at its
+# mount point — but it re-rooted that name at ONE hardcoded root. Every project outside it was
+# unconnectable, and the 404 quoted a container path the user had never typed.
+
+
+@pytest.fixture
+def out_of_root(monkeypatch, tmp_path):
+    """A project reachable only through a SECOND root, not a subdirectory of the first.
+
+    That is the real shape of it: the container sees each out-of-root project through its own
+    bind mount, so the alternative location is a root in its own right.
+    """
+    from synapse.core import registry
+    primary, extra = tmp_path / "primary", tmp_path / "extra"
+    primary.mkdir()
+    folder = extra / "story-app"
+    folder.mkdir(parents=True)
+    monkeypatch.setattr(settings, "projects_root", str(primary))
+    monkeypatch.setattr(settings, "extra_project_roots", str(extra))
+    monkeypatch.setattr(registry, "PROJECTS", {})
+    return folder
+
+
+def test_connect_finds_a_project_under_an_extra_root(client_engine, out_of_root):
+    client, _ = client_engine
+    r = client.post("/api/v1/projects/connect",
+                    json={"id": "story-app", "path": r"C:\Users\dev\story-app",
+                          "deep_seed": False})
+    assert r.status_code == 200, r.text
+    assert _settled(client, r.json())["state"] == "done"
+    assert (out_of_root / "CLAUDE.md").exists(), "wiring belongs in the real folder, not a guess"
+
+
+def test_a_project_that_exists_under_no_root_says_which_roots_it_searched(client_engine,
+                                                                         out_of_root):
+    """The old message named one container path and called it "not found", which sent the reader
+    looking for a missing folder instead of a missing ROOT."""
+    client, _ = client_engine
+    r = client.post("/api/v1/projects/connect",
+                    json={"id": "nowhere-app", "path": "/wherever/nowhere-app",
+                          "deep_seed": False})
+    assert r.status_code == 404
+    detail = r.json()["detail"]
+    assert "nowhere-app" in detail
+    assert str(out_of_root.parent) in detail, "every root actually searched must be named"
+
+
+def test_a_traversing_path_is_still_rejected(client_engine, out_of_root):
+    """Extra roots widen where a project may live; they do not weaken the traversal guard."""
+    client, _ = client_engine
+    r = client.post("/api/v1/projects/connect",
+                    json={"id": "escape", "path": "..", "deep_seed": False})
+    assert r.status_code == 400
 
 
 def test_timeline(client_engine):
@@ -450,3 +609,50 @@ def test_queue_maxsize_single_source_of_truth():
     from synapse.api.events import _QUEUE_MAXSIZE
     from synapse.models.api import QUEUE_MAXSIZE
     assert QUEUE_MAXSIZE == _QUEUE_MAXSIZE == 100
+
+
+# --- write provenance (roadmap item 13) ---------------------------------------
+
+
+def test_remember_attributes_the_write_from_the_request_body(client_engine):
+    client, engine = client_engine
+    r = client.post("/api/v1/knowledge", json={
+        "content": "we chose X", "scope": "acme-store",
+        "agent": "claude-code", "model": "claude-opus-5", "session_id": "sess-42",
+    })
+    assert r.status_code == 201
+    prov = engine.last_provenance
+    assert prov is not None
+    assert prov.agent == "claude-code" and prov.model == "claude-opus-5"
+    assert prov.session_id == "sess-42"
+
+
+def test_remember_still_attributes_when_the_body_omits_provenance(client_engine):
+    # A caller that sends nothing must not produce an anonymous write — the host is always known.
+    client, engine = client_engine
+    r = client.post("/api/v1/knowledge", json={"content": "we chose Y", "scope": "acme-store"})
+    assert r.status_code == 201
+    assert engine.last_provenance is not None
+    assert not engine.last_provenance.is_empty()
+
+
+def test_remember_response_forwards_the_pipelines_diagnostic_fields(client_engine):
+    # extra="allow" does NOT forward fields off a returned object — pydantic only harvests extras
+    # from a mapping. Every field a caller needs must be declared on RememberResponse. Found live:
+    # the global-write gate refiled a write but scope_redirected_from and reason both came back null.
+    from synapse.models.api import RememberResponse
+
+    declared = set(RememberResponse.model_fields)
+    for field in ("reason", "redactions", "scope_redirected_from", "duplicate_of",
+                  "contradicts", "entities", "degraded", "facts_extracted"):
+        assert field in declared, f"{field} would be silently stripped from the response"
+
+
+def test_remember_response_declares_everything_writeresult_exposes():
+    # A field added to WriteResult and forgotten here is invisible to every API caller.
+    from synapse.core.write_pipeline import WriteResult
+    from synapse.models.api import RememberResponse
+
+    internal_only = {"confidence", "source", "reference_time"}  # not part of the public surface
+    missing = set(WriteResult.model_fields) - set(RememberResponse.model_fields) - internal_only
+    assert not missing, f"RememberResponse is missing WriteResult fields: {sorted(missing)}"

@@ -12,6 +12,29 @@ Synapse builds a **temporal knowledge graph** where every fact has a `valid_from
 
 It also differs from raw graph databases: Graphiti handles entity resolution, temporal deduplication, and hybrid vector+graph retrieval out of the box. Synapse adds MCP tooling, multi-scope isolation (global / project / agent), cross-project knowledge linking, extraction-mode routing with credit-aware fallback, and a retrieval eval harness with a regression gate.
 
+---
+
+## What operating it found
+
+Running this against eleven real projects surfaced a defect in Graphiti itself: its edge-invalidation
+candidate search is unscoped, so an ordinary write silently retires unrelated facts that are still
+true. No error, no warning — the fact just stops appearing in search results.
+
+**Measured on this corpus: 70% of automatically-retired facts were still true** (28 of 40
+hand-labelled cases, 95% CI [54.6%, 81.9%]). A separate structural method put it at 75.6%, inside
+that interval — two methods sharing no mechanism, agreeing.
+
+The write-up is the most interesting thing in this repository, and it includes the two measurements
+that turned out to be wrong: **[docs/FINDING-silent-fact-loss.md](docs/FINDING-silent-fact-loss.md)**.
+Reproduce it with `scripts/audit_invalidations.py`, `scripts/validate_invalidation_guard.py` and
+`scripts/compare_guard_variants.py`.
+
+The mitigation ships here (`_revert_unjustified_invalidations`); the real fix belongs upstream in the
+candidate search, which is what [getzep/graphiti#1729](https://github.com/getzep/graphiti/pull/1729)
+proposes.
+
+---
+
 [![CI](https://github.com/alexsh88/synapse/actions/workflows/ci.yml/badge.svg)](https://github.com/alexsh88/synapse/actions/workflows/ci.yml)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
@@ -27,10 +50,10 @@ It also differs from raw graph databases: Graphiti handles entity resolution, te
 ## Features
 
 - **Temporal knowledge model** — every fact carries `valid_from` / `invalid_at`; knowledge is superseded, never deleted. "What did the agent believe in May?" is always answerable.
-- **MCP tools for any Claude Code session** — `remember`, `recall`, `brief`, `relate`, `search`, `forget`, `update` wired into any project with a single JSON stanza.
+- **MCP tools for any Claude Code session** — `remember`, `recall`, `brief`, `remember_runbook`, `runbooks`, `search`, `relate`, `forget`, `update` wired into any project with a single JSON stanza.
 - **`brief(project_id)` session-start context** — loads the distilled knowledge snapshot for a project at the start of every coding session; cached in Redis, served in milliseconds.
 - **Hybrid extraction routing with credit-aware fallback** — `cloud` (Claude Sonnet 4.6), `local` (gemma3:12b via Ollama, $0), or `hybrid` (local → Sonnet on failure). When local embedding is unavailable, writes are queued and replayed rather than dropped silently.
-- **Retrieval eval harness with regression gate** — golden set with positive, negative, and cross-project-leakage cases; MRR 0.531, 0 violations on the author's corpus. A >5% relative drop in hit@k or MRR, or any increase in violations, exits non-zero and blocks the run.
+- **Retrieval eval harness with regression gate** — golden set with positive, negative, and cross-project-leakage cases; hit@k **0.769** [0.654, 0.885], MRR **0.702** [0.587, 0.817], **0 violations** over 52 cases on the author's corpus, with 95% bootstrap intervals so a point estimate over 52 cases is never mistaken for a quality score. A >5% relative drop in hit@k or MRR, or *any* increase in violations, exits non-zero and blocks the run. Violations are gated absolutely, not relatively — a baseline containing any leak cannot be saved at all.
 - **Fail-closed degraded-path design** — extraction failures go to a review queue; the write pipeline never silently discards knowledge. Health endpoints surface degraded state so operators know.
 - **Curation with verify-no-loss safety** — dedup, decay, and archival tasks are gated by a `verify_no_loss` check that asserts no valid knowledge was removed before committing.
 
@@ -45,7 +68,7 @@ graph LR
     end
 
     subgraph "MCP Layer"
-        M[MCP Server<br/>remember · recall · brief<br/>relate · search · forget · update]
+        M[MCP Server<br/>remember · recall · brief<br/>remember_runbook · runbooks<br/>search · relate · forget · update]
     end
 
     subgraph "Synapse API  :8848"
@@ -114,7 +137,9 @@ cp .env.example .env
 
 docker compose up -d
 # Wait ~60 s for Neo4j to finish its first start.
-# All four services become (healthy): neo4j, redis, api, ui.
+# Six services come up: neo4j, redis, api, ui, worker, beat.
+# `worker` and `beat` run the scheduled curation — nightly dedup and health scans, the
+# consolidation proposal pass, and the pending-capture replay every 10 minutes.
 
 open http://localhost:5174   # Graph Explorer UI
 # API:          http://localhost:8848
@@ -153,7 +178,10 @@ Deeper engineering notes live in [docs/ENGINEERING.md](docs/ENGINEERING.md).
 
 ## Testing
 
-**201 tests** across unit, integration, and temporal-invariant suites.
+**649 tests** across unit, contract, and temporal-invariant suites, at 85% line coverage. They run against hand-written
+Protocol fakes — no live Neo4j, Redis, Ollama or Anthropic — so `pytest` is the same command locally
+and in CI. Live-service exercises are separate smoke scripts under `scripts/` (`mcp_smoke.py`,
+`write_smoke.py`, `retrieve_smoke.py`), run by hand against a running stack.
 
 The temporal-invariant tests (`tests/test_temporal_invariants.py`) assert on the Cypher queries emitted to Neo4j — verifying that `valid_from` / `invalid_at` constraints are written and enforced correctly, not just that the Python layer behaves.
 
@@ -181,7 +209,29 @@ python -m scripts.run_eval --save-baseline
 python -m scripts.run_eval
 ```
 
-On the author's production corpus (~2,900 nodes across ten projects) the gated baseline sits at MRR **0.531**, hit@k **0.562**, **0 violations**. A demo case set ships in `synapse/eval/cases.py`; point it at your own corpus and save your own baseline.
+On the author's corpus (4,651 fact edges as of 2026-08-19) the run over 52 cases measures:
+
+| metric | value | 95% CI (percentile bootstrap, 10k resamples) |
+|---|---|---|
+| hit@k | 0.769 | [0.654, 0.885] |
+| MRR | 0.702 | [0.587, 0.817] |
+| precision@k | 0.464 | — |
+| violations | **0** | — |
+
+The saved baseline, recorded earlier, is hit@k 0.827 / MRR 0.743, so the gate currently reports a
+7.0% / 5.5% relative drop. **The confidence intervals contain both**, which is the honest reading:
+at n=52 this harness cannot distinguish the two runs, and three of the four newly-missing cases sit
+in scopes that took automatic edge invalidations in the intervening weeks. It is reported rather
+than re-baselined, because banking a lower number to silence a gate is how gates stop meaning
+anything — the same reasoning `save_baseline` already applies to violations.
+
+Three caveats worth stating plainly. The 52-case set is the author's private one
+(`cases_private.py`, gitignored — it names real projects); what ships publicly is a 15-case demo set
+over fictional `acme-*` projects, so a clean run of the committed code reproduces the *harness*, not
+these numbers. The set has been used while tuning, which makes it a regression gate rather than an
+unbiased quality estimate. And n=52 is small enough that the intervals above are wide on purpose —
+a frozen held-out set is tracked as the next step in
+[docs/research/portfolio-strategy-2026-08.md](docs/research/portfolio-strategy-2026-08.md).
 
 ![Synapse UI in Docker](docs/images/synapse-ui-docker.png)
 
@@ -200,7 +250,7 @@ synapse/
 │   │   └── schema.py              # entity / relationship definitions
 │   ├── mcp/
 │   │   ├── server.py              # MCP server entry point
-│   │   └── tools.py               # remember, recall, brief, relate, search, forget, update
+│   │   └── tools.py               # the nine MCP tools (remember, recall, brief, runbooks, …)
 │   ├── api/
 │   │   ├── main.py                # FastAPI app
 │   │   ├── routes/                # knowledge, graph, search, curation, timeline, projects
@@ -224,7 +274,7 @@ synapse/
 │       ├── hooks/
 │       ├── lib/                   # API client, WebSocket, Zustand stores
 │       └── types/
-├── tests/                         # 201 tests (unit + integration + temporal-invariant)
+├── tests/                         # 649 tests (unit + contract + temporal-invariant, all fakes)
 ├── scripts/                       # run_eval.py, wire_project.py, seed helpers
 ├── docs/
 │   ├── architecture/              # schema, write-pipeline, retrieval, mcp-server, api
@@ -244,7 +294,7 @@ synapse/
 - **Embedding dimension locked at first ingestion** — BGE-M3 produces 1024-dimensional vectors; this is set in the Neo4j vector index schema on first write. Changing the dimension requires dropping the index and re-embedding the entire corpus.
 - **Local extraction drops ~14% of dense facts** — gemma3:12b in `local` mode silently misses roughly 14% of complex, information-dense writes compared to Claude Sonnet 4.6. These are detected by the write pipeline's structural validator and moved to the review queue rather than dropped silently, but they do require manual review.
 - **Desktop-first UI** — the graph explorer requires a real screen to be useful. Mobile layout does not break, but it is not the design target.
-- **Eval golden set is small** — ~15 cases covering positive, negative, and cross-project categories. Meaningful for regression detection; not large enough for statistical confidence in absolute metric comparisons. Extend `synapse/eval/cases.py` as real usage accumulates.
+- **Eval golden set is small, and it is not held out** — 52 private cases (15 in the public demo set) covering positive, negative, and cross-project categories. Two separate limits follow. It is too small for statistical confidence in absolute metric comparisons, so the numbers above carry no confidence interval. And it has been used during tuning, so it measures regression, not generalisation — treat it as a gate, not a score.
 
 ---
 

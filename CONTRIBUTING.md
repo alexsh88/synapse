@@ -16,10 +16,13 @@ Run tests:
 pytest tests/ -v
 ```
 
-The integration tests (`test_api.py`, `test_mcp_tools.py`, etc.) require the stack running:
+All 649 tests run against Protocol fakes — no live Neo4j, Redis, Ollama or Anthropic needed, which
+is why CI runs the same bare `pytest`. If a test ever needs a live service, it belongs in
+`scripts/*_smoke.py` instead, which you run by hand against a started stack:
 
 ```bash
 docker compose up -d
+python -m scripts.mcp_smoke      # exercises the MCP server + all nine tools
 ```
 
 **React UI**
@@ -51,10 +54,12 @@ Scope is optional but encouraged for the main packages (`mcp`, `api`, `core`, `u
 
 ## Before opening a PR
 
-1. Run the full test suite: `pytest tests/ -v`
-2. Run the retrieval eval against the baseline: `python -m scripts.run_eval --baseline synapse/eval/baseline.json`
-3. If you changed extraction or retrieval logic, save a new baseline only after confirming the run is better or equal: `python -m scripts.run_eval --save-baseline`
-4. Type-check the UI: `cd ui && npm run type-check`
+1. Run the full test suite: `pytest`
+2. Lint and type-check: `ruff check synapse tests scripts` and `mypy` (config in `pyproject.toml`;
+   mypy is scoped to `synapse/` and is currently clean, so any new error fails CI)
+3. Run the retrieval eval against the baseline: `python -m scripts.run_eval --baseline synapse/eval/baseline.json`
+4. If you changed extraction or retrieval logic, save a new baseline only after confirming the run is better or equal: `python -m scripts.run_eval --save-baseline`
+5. Type-check the UI: `cd ui && npm run typecheck`
 
 PRs that regress the eval gate (>5% relative drop in hit@k or MRR, or increased violations) will not be merged without an explanation.
 

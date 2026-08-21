@@ -71,7 +71,13 @@ class Settings(BaseSettings):
 
     # --- Write pipeline thresholds (plan Part 4) ---
     dedup_threshold: float = 0.9   # >= this cosine sim => duplicate, don't re-store
-    relate_floor: float = 0.75     # >= this (but < dedup) => adjudicate vs nearest
+    relate_floor: float = 0.75     # >= this (but < dedup) => adjudicate
+    # Top-k adjudication (roadmap item 16). Judging only the single nearest fact meant a write
+    # contradicting the SECOND-nearest was never flagged: the live graph held 7 Contradicts
+    # edges against 3,039 facts. Fetching neighbours is one cheap ANN query while each
+    # adjudication is an LLM call, so fetch width and judgement budget are separate knobs.
+    adjudication_candidates: int = 5
+    max_adjudications: int = 3
 
     # --- Curation fact<->fact thresholds (Phase 10/11; docs/architecture/curation.md) ---
     # Higher than the write-time dedup_threshold: measured on the live ~589-node graph,
@@ -98,10 +104,17 @@ class Settings(BaseSettings):
     # Used by the project connector (F2) to write wiring files and read docs for seeding.
     # Empty string = not configured; registry/connector will skip path-dependent operations.
     projects_root: str = ""
+    # Additional roots to search for a project folder, comma-separated (EXTRA_PROJECT_ROOTS).
+    # Not every project lives under one parent directory, and the container can only reach a host
+    # directory that is bind-mounted — so an out-of-root project is a ROOT of its own, not a
+    # subdirectory. Mount each one and list its container-side parent here. The primary root above
+    # is still searched first and still owns the connected-projects overlay.
+    extra_project_roots: str = ""
     # The HOST path of this synapse repo — written verbatim into project .mcp.json / hook commands
     # so Claude Code (running on the host) invokes the right venv python + scripts. Stays a host
     # path even when the API runs in a container (where the code is mounted at /app).
-    # Empty string = not configured; connector will skip wiring-file writes.
+    # Empty string = not configured; the connector then falls back to this repo's own on-disk
+    # location, which is the correct host path when wiring is run from the host (not the container).
     synapse_host_dir: str = ""
 
     # --- Project registry ---

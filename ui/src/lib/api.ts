@@ -103,11 +103,7 @@ export async function applyCuration(body: {
   return res.json() as Promise<ApplyResult>;
 }
 
-export async function remember(body: { content: string; type?: string; scope?: string }) {
-  const res = await fetch(`${BASE}/knowledge`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return res.json();
-}
+// No client for POST /knowledge on purpose. Agents write through MCP; the UI reads and curates.
+// The one there was had no caller — it read as a half-built feature rather than a decision.
+// Re-add it when a screen actually needs it. Note that rescoping an existing node (the
+// promote-to-global case) is PATCH /knowledge/{id}, not a fresh write through here.

@@ -127,7 +127,7 @@ export default function ConnectProjectModal({
                     <input
                       value={path}
                       onChange={(e) => setPath(e.target.value)}
-                      placeholder="C:/Users/gantz/dev/projects/my-project"
+                      placeholder="C:/Users/dev/dev/projects/my-project"
                       className="w-full rounded-lg border border-line bg-surface-2/60 px-3 py-2 font-mono text-xs text-text placeholder:text-muted/50 focus:border-accent/40 focus:outline-none"
                     />
                   </Field>

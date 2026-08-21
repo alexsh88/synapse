@@ -18,8 +18,13 @@ import pytest
 
 from synapse.eval.cases import EvalCase
 from synapse.eval.runner import (
+    CI_MIN_N,
+    BaselineHasViolations,
     CaseOutcome,
     EvalReport,
+    _hit_rate_of,
+    _mrr_of,
+    bootstrap_ci,
     compare_to_baseline,
     evaluate_case,
     load_baseline,
@@ -307,16 +312,39 @@ def test_regression_on_violations_increase():
     assert "violations" in regressions[0]
 
 
-def test_no_regression_when_violations_same():
+# The two tests below asserted the OPPOSITE until 2026-07-25: violations were compared relative
+# to the baseline, so a recorded leak became permission for that many leaks forever. Scope
+# isolation (R5) is a correctness property, not a metric — see compare_to_baseline's docstring.
+
+
+def test_regression_when_violations_merely_persist():
     current = _make_metrics(0.80, 0.70, violations=2)
     baseline = _make_metrics(0.80, 0.70, violations=2)
-    assert compare_to_baseline(current, baseline) == []
+    assert compare_to_baseline(current, baseline) != []
 
 
-def test_no_regression_when_violations_decrease():
+def test_regression_even_when_violations_decrease():
+    # Fewer leaks is progress, not success. Two projects can still see each other's knowledge.
     current = _make_metrics(0.80, 0.70, violations=1)
     baseline = _make_metrics(0.80, 0.70, violations=3)
-    assert compare_to_baseline(current, baseline) == []
+    assert compare_to_baseline(current, baseline) != []
+
+
+def test_no_regression_when_violations_are_zero():
+    clean = _make_metrics(0.80, 0.70, violations=0)
+    assert compare_to_baseline(clean, clean) == []
+
+
+def test_save_baseline_refuses_to_enshrine_violations():
+    # The hole this closes: the gate only compared against the recorded number, so one
+    # --save-baseline on a leaking config would silence it permanently.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "baseline.json"
+        with pytest.raises(BaselineHasViolations):
+            save_baseline(_make_metrics(0.80, 0.70, violations=1), path)
+        assert not path.exists()
+        save_baseline(_make_metrics(0.80, 0.70, violations=0), path)
+        assert json.loads(path.read_text())["OVERALL"]["violations"] == 0
 
 
 def test_regression_threshold_exactly_at_boundary():
@@ -402,3 +430,82 @@ def test_neg_off_topic_produces_no_violations_on_clean_results():
     out = evaluate_case(case, [R("no knowledge found")])
     assert out.violations == 0
     assert not out.hit
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap confidence intervals
+# ---------------------------------------------------------------------------
+
+def _outcomes(hits: int, misses: int, *, rank: int = 1) -> list[CaseOutcome]:
+    return (
+        [CaseOutcome(id=f"h{i}", category="acme-api", hit=True, rank=rank) for i in range(hits)]
+        + [CaseOutcome(id=f"m{i}", category="acme-api", hit=False) for i in range(misses)]
+    )
+
+
+def test_ci_is_none_below_the_minimum_sample_size():
+    """An interval over a handful of cases spans nearly everything; None says so honestly."""
+    assert bootstrap_ci(_outcomes(CI_MIN_N - 1, 0), _hit_rate_of) is None
+
+
+def test_ci_is_reported_at_the_minimum_sample_size():
+    assert bootstrap_ci(_outcomes(CI_MIN_N, 0), _hit_rate_of) is not None
+
+
+def test_ci_is_deterministic_across_runs():
+    """A jittering interval cannot be diffed against the baseline, which is the whole use."""
+    group = _outcomes(30, 20)
+    assert bootstrap_ci(group, _hit_rate_of) == bootstrap_ci(group, _hit_rate_of)
+
+
+def test_ci_brackets_the_point_estimate():
+    group = _outcomes(30, 20)
+    lo, hi = bootstrap_ci(group, _hit_rate_of)
+    assert lo <= _hit_rate_of(group) <= hi
+
+
+def test_ci_collapses_when_every_case_agrees():
+    """No sampling error to estimate when every resample is identical."""
+    assert bootstrap_ci(_outcomes(40, 0), _hit_rate_of) == (1.0, 1.0)
+    assert bootstrap_ci(_outcomes(0, 40), _hit_rate_of) == (0.0, 0.0)
+
+
+def test_ci_narrows_as_the_sample_grows():
+    """The property that makes it worth reporting: more cases, less uncertainty."""
+    # Same resample count on both sides so the only difference is the sample size, and fewer
+    # than the default because this is the one test whose cost scales with both.
+    small_lo, small_hi = bootstrap_ci(_outcomes(6, 6), _hit_rate_of, resamples=2000)
+    large_lo, large_hi = bootstrap_ci(_outcomes(150, 150), _hit_rate_of, resamples=2000)
+    assert (large_hi - large_lo) < (small_hi - small_lo)
+
+
+def test_mrr_ci_reflects_rank_quality():
+    """Rank-3 hits must produce a strictly lower interval than rank-1 hits."""
+    top = bootstrap_ci(_outcomes(20, 0, rank=1), _mrr_of)
+    deep = bootstrap_ci(_outcomes(20, 0, rank=3), _mrr_of)
+    assert deep[1] < top[0]
+
+
+def test_metrics_carry_intervals_for_overall_but_not_tiny_categories():
+    report = EvalReport(outcomes=_outcomes(20, 10) + [
+        CaseOutcome(id="solo", category="synapse", hit=True, rank=1)
+    ])
+    m = report.metrics()
+    assert m["OVERALL"]["hit_rate_ci"] is not None
+    assert m["OVERALL"]["mrr_ci"] is not None
+    assert m["synapse"]["hit_rate_ci"] is None, "n=1 must not get an interval"
+
+
+def test_format_prints_the_interval():
+    report = EvalReport(outcomes=_outcomes(20, 10))
+    assert "95% CI" in report.format()
+
+
+def test_baseline_round_trips_with_intervals(tmp_path):
+    """Intervals are tuples in Python and lists in JSON — the gate must survive the round trip."""
+    path = tmp_path / "baseline.json"
+    metrics = EvalReport(outcomes=_outcomes(20, 10)).metrics()
+    save_baseline(metrics, path)
+    loaded = load_baseline(path)
+    assert loaded["OVERALL"]["hit_rate_ci"] == list(metrics["OVERALL"]["hit_rate_ci"])
+    assert compare_to_baseline(metrics, loaded) == []

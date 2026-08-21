@@ -28,8 +28,12 @@ from pydantic import BaseModel, Field
 class EvalCase(BaseModel):
     id: str
     query: str
-    category: Literal["acme-api", "acme-data", "global", "cross_project", "negative",
-                      "acme-api", "acme-web", "acme-infra"]
+    # Free-form on purpose. This was a Literal enumerating every category, which meant expanding
+    # the private golden set required adding REAL project names to this committed file — leaking
+    # them into the public repo, the exact thing the registry split exists to prevent. The runner
+    # groups by whatever string appears here, so an enum bought nothing but a privacy hazard.
+    # Conventional values: a project id, "global", "cluster", "cross_project", "negative".
+    category: str
     expect_any: list[str] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
     must_not_match: list[str] = Field(default_factory=list)

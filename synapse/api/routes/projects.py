@@ -1,9 +1,9 @@
 """Projects routes — status list + one-click connect (Phase 5 / 12).
 
 GET /projects        — every registered project with connection status + knowledge counts.
-POST /projects/connect — write wiring files + seed the Project entity (sync), then deep-seed the
-                         project's docs in the background; returns a job id.
-GET /projects/connect/{job_id} — poll deep-seed progress (also streamed over the WebSocket).
+POST /projects/connect — write the wiring files (filesystem only) and return a job id; ALL graph
+                         writes — the Project entity and the doc deep-seed — run in the background.
+GET /projects/connect/{job_id} — poll seed progress (also streamed over the WebSocket).
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from pydantic import BaseModel
 
 from synapse.api.deps import get_engine
 from synapse.api.events import KnowledgeEvent, bus
-from synapse.config import settings
 from synapse.core import registry
 from synapse.core.project_connector import ProjectConnector
 from synapse.models.api import ConnectJobResponse
@@ -51,12 +50,29 @@ class ConnectBody(BaseModel):
 
 
 def _resolve_folder(host_path: str) -> Path:
-    """IO folder under projects_root; reject anything that escapes it (no traversal)."""
-    root = Path(settings.projects_root).resolve()
-    folder = (root / registry.folder_name(host_path)).resolve()
-    if root not in folder.parents and folder != root:
-        raise HTTPException(status_code=400, detail="project path escapes projects_root")
-    return folder
+    """The project's IO folder, searched across every configured root; 404 if it is under none.
+
+    Only the folder NAME survives resolution — the container reaches host directories through bind
+    mounts, so a host path has to be re-rooted at its mount point. That rewrite used to target one
+    hardcoded root, which left every project outside it unconnectable and reported the failure as
+    a missing folder at a CONTAINER path the caller had never typed. Traversal is still rejected,
+    now per root.
+    """
+    name = registry.folder_name(host_path)
+    searched: list[str] = []
+    for root in registry.project_roots():
+        root = root.resolve()
+        folder = (root / name).resolve()
+        if root not in folder.parents and folder != root:
+            raise HTTPException(status_code=400, detail="project path escapes its projects root")
+        if folder.is_dir():
+            return folder
+        searched.append(str(root))
+    raise HTTPException(
+        status_code=404,
+        detail=f"no folder named {name!r} under any configured project root — searched: "
+               f"{', '.join(searched)}",
+    )
 
 
 @router.get("/projects")
@@ -73,7 +89,7 @@ async def projects(engine=Depends(get_engine)):
             folder = registry.project_folder(meta["path"])
             name, cluster = meta["name"], meta["cluster"]
         else:
-            folder = Path(settings.projects_root) / pid          # graph-only: assume folder == id
+            folder = registry.project_folder(pid)                # graph-only: assume folder == id
             name, cluster = pid.replace("-", " ").title(), "added"
         st = _connector.status(folder)
         c = counts.get(pid)
@@ -94,24 +110,20 @@ async def connect(body: ConnectBody, engine=Depends(get_engine)):
     meta = registry.all_projects().get(pid)   # includes UI-added overlay (path for re-connect)
     name = body.name or (meta["name"] if meta else pid.replace("-", " ").title())
     host_path = body.path or (meta["path"] if meta else None)
-    # Fall back to projects_root/<id> for a graph-only re-connect (folder named like the id).
-    if not host_path and (Path(settings.projects_root) / pid).exists():
-        host_path = str(Path(settings.projects_root) / pid)
+    # Fall back to <root>/<id> for a graph-only re-connect (folder named like the id).
+    if not host_path and (guess := registry.project_folder(pid)).is_dir():
+        host_path = str(guess)
     description = body.description or (meta["desc"] if meta else
                                       f"{name} is a project connected to Synapse.")
     if not host_path:
         raise HTTPException(status_code=422, detail="path required for an unregistered project")
 
-    folder = _resolve_folder(host_path)
-    if not folder.exists():
-        raise HTTPException(status_code=404, detail=f"project folder not found: {folder}")
+    folder = _resolve_folder(host_path)   # 404s, naming the roots, when none of them holds it
 
     actions = _connector.write_files(folder, pid, name)
     blocked = [a for a in actions if a.startswith(("ABORT", "SKIP"))]
     if blocked:
         raise HTTPException(status_code=409, detail="; ".join(blocked))
-
-    entity = await _connector.seed_entity(engine, pid, description)
 
     # Remember UI-added (unregistered) projects so they persist with their real name/path.
     if pid not in registry.PROJECTS:
@@ -120,13 +132,11 @@ async def connect(body: ConnectBody, engine=Depends(get_engine)):
     job_id = uuid.uuid4().hex[:12]
     import time as _time
     _evict_old_jobs()
-    _JOBS[job_id] = {"job_id": job_id, "project": pid, "state": "done", "done": 0,
-                     "total": 0, "stored": 0, "actions": actions, "entity": entity,
+    _JOBS[job_id] = {"job_id": job_id, "project": pid, "state": "running", "done": 0,
+                     "total": 0, "stored": 0, "actions": actions, "entity": None,
                      "_created_at": _time.monotonic()}
-    if body.deep_seed:
-        _JOBS[job_id]["state"] = "running"
-        asyncio.create_task(_run_deep_seed(job_id, engine, pid, folder))
-
+    asyncio.create_task(_run_seed(job_id, engine, pid, folder, description,
+                                  deep_seed=body.deep_seed))
     return _JOBS[job_id]
 
 
@@ -139,7 +149,16 @@ async def connect_status(job_id: str):
     return job
 
 
-async def _run_deep_seed(job_id: str, engine, project_id: str, folder: Path) -> None:
+async def _run_seed(job_id: str, engine, project_id: str, folder: Path, description: str,
+                    *, deep_seed: bool) -> None:
+    """Every graph write a connect performs, off the request thread.
+
+    Seeding the Project entity used to be awaited inline "because it's just one write" — but one
+    write is a full LLM extraction. Measured on the connect that exposed this: 73s, against
+    nginx's default 60s proxy_read_timeout. The browser got a 504 while the seed went on to
+    succeed in the background, which is the worst kind of failure — a false one. The request now
+    does filesystem work only, and the job carries everything slow.
+    """
     job = _JOBS[job_id]
     scope = f"project_{project_id}"
 
@@ -151,13 +170,15 @@ async def _run_deep_seed(job_id: str, engine, project_id: str, folder: Path) -> 
             await bus.publish(KnowledgeEvent(type="knowledge.added", scope=scope, summary=fact))
 
     try:
-        result = await _connector.deep_seed(engine, project_id, folder, on_progress)
-        job.update(state="done", **result)
+        job["entity"] = await _connector.seed_entity(engine, project_id, description)
+        if deep_seed:
+            job.update(**await _connector.deep_seed(engine, project_id, folder, on_progress))
+        job["state"] = "done"
         await engine.reader.invalidate_brief(project_id)
         await bus.publish(KnowledgeEvent(type="project.connect.done", id=job_id, scope=scope,
                                          state="done", done=job["total"], total=job["total"], stored=job["stored"]))
     except Exception as exc:  # noqa: BLE001
-        logger.exception("deep-seed failed for %s", project_id)
+        logger.exception("seed failed for %s", project_id)
         job.update(state="error", error=str(exc))
         await bus.publish(KnowledgeEvent(type="project.connect.done", id=job_id, scope=scope,
                                          state="error", error=str(exc)))

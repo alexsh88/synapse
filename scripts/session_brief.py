@@ -11,7 +11,8 @@ Wire it into a project's .claude/settings.json:
     "hooks": {
       "SessionStart": [
         { "hooks": [ { "type": "command",
-            "command": "/path/to/synapse/.venv/Scripts/python.exe /path/to/synapse/scripts/session_brief.py <project_id>" } ] }
+            "command": "<synapse>/.venv/bin/python <synapse>/scripts/session_brief.py <project_id>" } ] }
+            # Windows: <synapse>/.venv/Scripts/python.exe — `wire_project` picks the right one.
       ]
     }
   }
@@ -65,6 +66,9 @@ def main() -> int:
     lines += _section("Active conventions", b.get("active_conventions"))
     lines += _section("Relevant lessons", b.get("relevant_lessons"))
     lines += _section("Cross-project knowledge", b.get("cross_project_knowledge"))
+    # Knowledge the label-driven sections structurally cannot reach — it lives on untyped
+    # entities, which brief() cannot query by label (research §2.3 correction).
+    lines += _section("Recently learned", b.get("recent_facts"))
 
     body = "\n".join(lines).strip()
     if len(lines) <= 2:  # nothing but the header → don't inject noise

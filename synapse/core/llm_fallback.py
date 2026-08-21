@@ -20,6 +20,7 @@ import logging
 import time
 
 from synapse.config import settings
+from synapse.core import cost
 
 logger = logging.getLogger("synapse.llm_fallback")
 
@@ -173,7 +174,21 @@ async def haiku_or_local(system: str, user: str, *, max_tokens: int = 800) -> tu
             msg = await client.messages.create(
                 model=settings.triage_model, max_tokens=max_tokens,
                 system=system, messages=[{"role": "user", "content": user}])
-            text = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text").strip()
+            # getattr on both sides: `msg.content` is a union of a dozen block types and only
+            # TextBlock carries `.text`, so the type guard and the access have to agree.
+            text = "".join(
+                getattr(b, "text", "") for b in msg.content if getattr(b, "type", None) == "text"
+            ).strip()
+            # This is one of the few calls Synapse makes directly, so its usage is visible and
+            # exact — unlike extraction, which Graphiti mediates. Recorded before returning so a
+            # caller that discards the text still pays for it in the ledger.
+            usage = getattr(msg, "usage", None)
+            if usage is not None:
+                await cost.track_usage(
+                    operation="triage", model=settings.triage_model, provider="anthropic",
+                    input_tokens=getattr(usage, "input_tokens", 0) or 0,
+                    output_tokens=getattr(usage, "output_tokens", 0) or 0,
+                )
             return text, "haiku"
         except Exception as exc:  # noqa: BLE001
             if is_credit_error(exc):
@@ -183,9 +198,19 @@ async def haiku_or_local(system: str, user: str, *, max_tokens: int = 800) -> tu
 
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI(base_url=settings.ollama_base_url, api_key="ollama")
-    resp = await client.chat.completions.create(
+    # Distinct name: `client` above is an AsyncAnthropic, and rebinding it here made the two
+    # clients look interchangeable when they share no interface.
+    local_client = AsyncOpenAI(base_url=settings.ollama_base_url, api_key="ollama")
+    resp = await local_client.chat.completions.create(
         model=settings.local_extraction_model,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0, max_tokens=max_tokens)
+    # Free at the margin, but recorded anyway: the ledger's job includes showing how much the
+    # local path is *saving*, which needs the local calls counted, not omitted.
+    local_usage = getattr(resp, "usage", None)
+    await cost.track_usage(
+        operation="triage", model=settings.local_extraction_model, provider="ollama",
+        input_tokens=getattr(local_usage, "prompt_tokens", 0) or 0,
+        output_tokens=getattr(local_usage, "completion_tokens", 0) or 0,
+    )
     return resp.choices[0].message.content or "", "local"

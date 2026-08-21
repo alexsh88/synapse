@@ -78,13 +78,16 @@ closed.
 
 ## How I know it works
 
-Not because it feels done — because it's measured. There are 201 tests, including
+Not because it feels done — because it's measured. There are 649 tests, including
 invariant tests that assert on the *emitted Cypher* for the temporal guarantees
 (concurrency safety, end-to-end supersession) rather than trusting a design doc.
 Retrieval has an eval harness with negative cases (including a check that one
 project's knowledge never leaks into a sibling with a similar name) and a regression
 gate that fails CI if MRR drops more than 5% or any violation reappears. The tuning
-story is in the numbers: MRR 0.484 → 0.531 with no hits lost, violations 3 → 0. The
+story is in the numbers: MRR 0.484 → 0.531 with no hits lost, violations 3 → 0; as the
+golden set grew to 52 cases the gate moved to MRR 0.743, hit@k 0.827, still 0 violations.
+I should say what that number is and isn't: the set was used while tuning, so it measures
+regression, not generalisation. A frozen held-out set is the next thing I owe it. The
 eval also earns its keep by telling me when a miss is a *curation* gap (a fact
 invalidated with no successor) rather than a ranking bug — a distinction I couldn't
 make before.

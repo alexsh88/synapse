@@ -92,19 +92,62 @@ def all_projects() -> dict:
     return {**PROJECTS, **overlay}
 
 
+# Clusters that exist only as registry bookkeeping, not as a shared knowledge domain. A project
+# in one of these gets no cluster tier at retrieval time (global + project only).
+_NON_DOMAIN_CLUSTERS = frozenset({"", "added", "standalone", "none"})
+
+
+def cluster_of(project_id: str) -> str | None:
+    """The domain cluster a project belongs to, or ``None`` if it has no shared domain.
+
+    The map lives in the REGISTRY (``projects.json``, gitignored) rather than in code, so real
+    project names never reach the public repo — the same reason the registry exists at all.
+    Retrieval uses this to compose the ``cluster_*`` tier (research §0); see
+    :meth:`synapse.core.schema.Scope.cluster`.
+    """
+    meta = all_projects().get(project_id)
+    if not meta:
+        return None
+    cluster = str(meta.get("cluster") or "").strip().lower()
+    return None if cluster in _NON_DOMAIN_CLUSTERS else cluster
+
+
 def folder_name(host_path: str) -> str:
     """Last path segment, robust to Windows backslashes even when parsed on Linux."""
     return re.split(r"[\\/]", host_path.rstrip("\\/"))[-1]
 
 
-def project_folder(host_path: str) -> Path:
-    """The IO path for a project under the (host or container) projects_root.
+def project_roots() -> list[Path]:
+    """Every directory a project folder may live under, primary first.
 
-    On the host: <projects_root>/<folder>. In the API container: /projects/<folder>
-    (the mounted host projects dir). Derived from the folder name, so it's correct on both.
+    The primary root is special beyond ordering: it owns the connected-projects overlay, and it is
+    where an unresolvable project is reported against. Extras exist because projects don't all
+    share one parent directory — and since the container reaches a host directory only through a
+    bind mount, an out-of-root project arrives as its own root rather than a subdirectory.
     """
-    root = settings.projects_root or "."
-    return Path(root) / folder_name(host_path)
+    roots = [settings.projects_root or "."]
+    # Blank segments (a stray comma in the env var) would otherwise become Path("."), silently
+    # resolving every project against the process working directory.
+    roots += [r.strip() for r in settings.extra_project_roots.split(",") if r.strip()]
+    return [Path(r) for r in roots]
+
+
+def project_folder(host_path: str) -> Path:
+    """The IO path for a project, resolved against each configured root in order.
+
+    On the host: <root>/<folder>. In the API container: /projects/<folder> or an extra mount.
+    Derived from the folder name, so it's correct on both.
+
+    Falls back to <primary>/<folder> when the folder exists under no root, because the project
+    LIST asks for a path in order to report ``exists: false`` about it — callers that need the
+    absence to be an error check it themselves.
+    """
+    name = folder_name(host_path)
+    roots = project_roots()
+    for root in roots:
+        if (candidate := root / name).is_dir():
+            return candidate
+    return roots[0] / name
 
 
 def pretty_scope(scope: str) -> str:

@@ -8,6 +8,36 @@
 
 name: synapse
 
+# Shared by api, worker and beat — all three are the same image with the same view of the stack.
+# Held in one place on purpose: when these drifted, the symptom was never "the worker has the wrong
+# NEO4J_URI", it was a curation scan that silently never ran.
+x-synapse-service: &synapse-service
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  env_file:
+    - .env
+  # Anchored separately: a service that declares its own `environment:` replaces the merged one
+  # outright, so api re-merges this mapping rather than silently losing every value below.
+  environment: &synapse-service-env
+    # Override the host-oriented .env values for the compose network (OS env > .env in pydantic).
+    NEO4J_URI: "bolt://neo4j:7687"          # compose-internal port, not the host-mapped 7688
+    REDIS_URL: "redis://redis:6379/0"
+    OLLAMA_BASE_URL: "http://host.docker.internal:11434/v1"
+    EXTRACTION_MODE: "hybrid"          # gemma3:12b local (strict) -> Sonnet fallback (near-$0 writes)
+    # Write provenance records the host that produced a write (roadmap item 13). Inside a
+    # container gethostname() returns the container ID — ephemeral, and useless for the query
+    # this field exists to serve ("which machine produced this bad batch?"). Name the host.
+    SYNAPSE_HOST: "${SYNAPSE_HOST:-workstation}"
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  depends_on:
+    neo4j:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
 services:
   neo4j:
     image: neo4j:5-community
@@ -44,7 +74,18 @@ services:
     container_name: synapse-redis
     restart: unless-stopped
     ports:
-      - "6382:6379"   # Celery broker + brief cache
+      # 127.0.0.1 only. The API reaches Redis over the compose network, and host-side scripts
+      # reach it over loopback — nothing legitimately connects from another machine. Published
+      # on 0.0.0.0 (the compose default) this was an unauthenticated broker + cache open to
+      # anything that could route to this host, which stopped being theoretical the moment a
+      # second machine joined. Neo4j is deliberately NOT restricted this way: running the Mac
+      # as a second client against this Bolt port is a supported setup.
+      - "127.0.0.1:6382:6379"   # Celery broker + brief cache
+    # No --requirepass: on a loopback-only port it would add little, and half-adding it is worse
+    # than not adding it — a password here without the matching credential in REDIS_URL locks the
+    # API out of its own broker. If this port is ever republished beyond loopback, add BOTH in one
+    # change: `--requirepass "$$REDIS_PASSWORD"` here and `redis://:<password>@redis:6379/0` as
+    # REDIS_URL on the api service (and update the healthcheck below to pass `-a`).
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
@@ -59,38 +100,65 @@ services:
   # host); neo4j/redis over the compose network. The projects root is mounted so the "Connect
   # project" feature can write wiring files into each project. `docker compose up -d` = whole stack.
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *synapse-service
     container_name: synapse-api
-    restart: unless-stopped
+    ports:
+      - "8848:8848"
+    environment:
+      <<: *synapse-service-env
+      # Only the API writes wiring files into projects, so only the API needs a projects root.
+      # Projects that live outside it are reachable only through their own bind mount, so they
+      # arrive as extra ROOTS rather than subdirectories. Mount each at /extra/<folder> in
+      # docker-compose.override.yml and set EXTRA_PROJECT_ROOTS: "/extra" there — personal paths
+      # stay out of this file. The primary root is searched first and owns the overlay.
+      PROJECTS_ROOT: "/projects"
+    volumes:
+      - ".:/app"                               # live code in dev (shadows the image's /app/synapse)
+      - "${SYNAPSE_PROJECTS_ROOT:-./projects-mount}:/projects"  # write wiring files (F2)
+    healthcheck:
+      # /readyz, not /health: health is liveness and answers ok with Neo4j down, so gating the UI
+      # on it meant "the process started", not "the API can serve a request".
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8848/api/v1/readyz', timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  # Celery worker — executes the scheduled curation/replay tasks. Without this service the beat
+  # schedule below had nothing to run it, so nightly dedup, the health scan, consolidation and the
+  # pending-capture replay never happened on any deployment of this file. The write path's own
+  # catch-net for near-simultaneous contradictory writes is the nightly contradiction scan, which
+  # made that a correctness gap, not just a missing convenience.
+  worker:
+    <<: *synapse-service
+    container_name: synapse-worker
+    command: ["celery", "-A", "synapse.workers.celery_app", "worker", "--loglevel=info", "--concurrency=2"]
+    volumes:
+      - ".:/app"
+    healthcheck:
+      # `inspect ping` round-trips through the broker to this worker, so it fails if the process
+      # is up but cannot reach Redis — which is the failure that matters here.
+      test: ["CMD", "celery", "-A", "synapse.workers.celery_app", "inspect", "ping", "-d", "celery@$$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # Celery beat — the scheduler. Separate service because exactly one beat may run per broker
+  # (two would double-fire every schedule), while workers scale horizontally.
+  beat:
+    <<: *synapse-service
+    container_name: synapse-beat
+    command: ["celery", "-A", "synapse.workers.celery_app", "beat", "--loglevel=info", "--schedule=/tmp/celerybeat-schedule"]
+    volumes:
+      - ".:/app"
     depends_on:
       neo4j:
         condition: service_healthy
       redis:
         condition: service_healthy
-    ports:
-      - "8848:8848"
-    env_file:
-      - .env
-    environment:
-      # Override the host-oriented .env values for the compose network (OS env > .env in pydantic).
-      NEO4J_URI: "bolt://neo4j:7687"          # compose-internal port, not the host-mapped 7688
-      REDIS_URL: "redis://redis:6379/0"
-      OLLAMA_BASE_URL: "http://host.docker.internal:11434/v1"
-      PROJECTS_ROOT: "/projects"
-      EXTRACTION_MODE: "hybrid"          # gemma3:12b local (strict) -> Sonnet fallback (near-$0 writes)
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - ".:/app"                               # live code in dev (shadows the image's /app/synapse)
-      - "${SYNAPSE_PROJECTS_ROOT:-./projects-mount}:/projects"  # write wiring files (F2)
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8848/api/v1/health', timeout=3).status==200 else 1)"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 40s
+      worker:
+        condition: service_started
 
   # Synapse UI — the React/Vite app, built and served by nginx. Reverse-proxies /api and /ws
   # to the api service (see ui/nginx.conf), so the browser only ever talks to this one origin.

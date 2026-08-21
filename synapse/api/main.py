@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +20,7 @@ from synapse.api.routes import capture, curation, graph, knowledge, projects, se
 from synapse.api import websocket
 from synapse.api.deps import require_api_key
 from synapse.config import settings
+from synapse.core import registry
 
 # Ensure INFO logs reach the console when the app is loaded by uvicorn directly
 # (uvicorn configures its own root logger only after import; we guard to avoid
@@ -42,11 +42,15 @@ async def lifespan(app: FastAPI):
         logger.warning("NEO4J_PASSWORD is not set — Neo4j connections will fail")
     if not settings.projects_root:
         logger.warning("SYNAPSE_PROJECTS_ROOT is not set — project connector features are disabled")
-    elif not Path(settings.projects_root).exists():
-        logger.warning(
-            "projects_root does not exist: %s — project connector will fail",
-            settings.projects_root,
-        )
+    else:
+        # Every root, not just the primary: an extra root is typically its own bind mount, and a
+        # mount that silently failed to appear looks exactly like "project folder not found".
+        for root in registry.project_roots():
+            if not root.exists():
+                logger.warning(
+                    "configured project root does not exist: %s — projects under it cannot connect",
+                    root,
+                )
 
     logger.info("API starting; connecting knowledge engine...")
     engine = await KnowledgeEngine().connect()
@@ -82,8 +86,59 @@ app.add_middleware(
 
 
 @app.get("/api/v1/health")
-async def health():
+async def health() -> dict[str, str]:
+    """LIVENESS only — "this process is answering". It deliberately touches nothing.
+
+    Kept as-is because the compose healthcheck, the migration runbook and the UI all call it.
+    For "can this instance actually serve a request", use /api/v1/readyz — the distinction
+    matters, because this endpoint returns ok with Neo4j, Redis and Ollama all unreachable.
+    """
     return {"status": "ok"}
+
+
+@app.get("/api/v1/readyz")
+async def readyz() -> JSONResponse:
+    """READINESS — reaches every dependency and reports each one by name.
+
+    503 when anything required is down, so `depends_on: service_healthy` and any external
+    probe mean "ready to serve" rather than "process started". Redis is optional (it caches
+    briefs), so an unconfigured Redis is reported without failing readiness; a *configured*
+    Redis that cannot be reached does fail it.
+    """
+    checks: dict[str, str] = {}
+    required: list[str] = ["engine", "neo4j"]
+
+    engine = getattr(app.state, "engine", None)
+    if engine is None:
+        checks["engine"] = "not connected"
+    else:
+        checks["engine"] = "ok"
+        driver = getattr(engine.graphiti, "driver", None)
+        if driver is None:
+            checks["neo4j"] = "no driver"
+        else:
+            try:
+                await driver.execute_query("RETURN 1")
+                checks["neo4j"] = "ok"
+            except Exception as exc:  # noqa: BLE001 — report any failure, never raise from a probe
+                checks["neo4j"] = f"error: {type(exc).__name__}"
+
+        redis = getattr(engine.reader, "redis", None) if engine.reader is not None else None
+        if redis is None:
+            checks["redis"] = "not configured"
+        else:
+            required.append("redis")
+            try:
+                await redis.ping()
+                checks["redis"] = "ok"
+            except Exception as exc:  # noqa: BLE001
+                checks["redis"] = f"error: {type(exc).__name__}"
+
+    ready = all(checks.get(name) == "ok" for name in required)
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"ready": ready, "checks": checks},
+    )
 
 
 _API = "/api/v1"

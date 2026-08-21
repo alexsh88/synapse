@@ -38,6 +38,12 @@ celery_app.conf.update(
             "task": "synapse.curation.scan_health",
             "schedule": crontab(hour=3, minute=15),
         },
+        # PROPOSE-ONLY: runs after the scans so it reads a fresh duplicate analysis. Writes
+        # CurationProposal nodes for human review; never mutates knowledge (research Wave 2).
+        "nightly-consolidation": {
+            "task": "synapse.curation.consolidate",
+            "schedule": crontab(hour=3, minute=30),
+        },
         # WRITE task: retry queued writes from Ollama outages (every 10 minutes).
         "replay-pending-captures": {
             "task": "replay_pending_captures",

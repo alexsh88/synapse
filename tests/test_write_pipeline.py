@@ -8,6 +8,7 @@ touching the network. A live end-to-end run lives in scripts/schema_smoke.py.
 
 from __future__ import annotations
 
+from synapse.core.redaction import redact
 from synapse.core.schema import ENTITY_TYPES
 from synapse.core.write_pipeline import (
     Adjudication,
@@ -498,3 +499,443 @@ async def test_vector_index_falls_back_to_scan_on_error():
     assert any("vector.similarity.cosine" in q for q in driver.queries)  # scan fallback ran
     assert nearest is not None
     assert nearest.uuid == "edge-scan"
+
+
+# --- redaction gate (research 2026-07-25 §5.1, Wave 0) -----------------------
+# The contract is not just "the stored fact is clean" — it is that the credential never
+# reaches ANY collaborator: not the triage LLM (an outbound API call), not the embedder
+# (it would land in the vector index), not Graphiti. These fakes record what they were
+# handed so each boundary is asserted independently.
+
+FAKE_KEY = "sk-ant-api03-" + "A1b2C3d4E5f6G7h8" * 4
+SECRET_TEXT = f"Deploy uses ANTHROPIC_API_KEY={FAKE_KEY} and it must be rotated quarterly."
+
+
+class RecordingEmbedder:
+    def __init__(self):
+        self.seen: list[str] = []
+
+    async def create(self, input_data: str) -> list[float]:
+        self.seen.append(input_data)
+        return [0.1] * 1024
+
+
+class RecordingTriage(FakeTriage):
+    def __init__(self, verdict, adjudication=None):
+        super().__init__(verdict, adjudication)
+        self.classified: list[str] = []
+
+    async def classify(self, content, hint_type):
+        self.classified.append(content)
+        return await super().classify(content, hint_type)
+
+
+def make_recording_pipeline(*, verdict=STORABLE, nearest=None):
+    graphiti = FakeGraphiti()
+    embedder = RecordingEmbedder()
+    triage = RecordingTriage(verdict)
+    pipeline = WritePipeline(
+        graphiti=graphiti, embedder=embedder, index=FakeIndex(nearest), triage=triage,
+        dedup_threshold=0.9, relate_floor=0.75,
+    )
+    return pipeline, graphiti, embedder, triage
+
+
+async def test_secret_never_reaches_triage_embedder_or_graph():
+    pipeline, graphiti, embedder, triage = make_recording_pipeline()
+    result = await pipeline.remember(SECRET_TEXT, project_id="acme-store")
+
+    assert result.outcome is Outcome.STORED
+    # 1. the triage LLM (an outbound Anthropic call) never saw the key
+    assert triage.classified and all(FAKE_KEY not in c for c in triage.classified)
+    # 2. the embedder never saw it → it cannot enter the vector index
+    assert embedder.seen and all(FAKE_KEY not in s for s in embedder.seen)
+    # 3. Graphiti never saw it → it cannot enter the graph
+    assert all(FAKE_KEY not in call["episode_body"] for call in graphiti.calls)
+    # 4. the caller is told what was stripped, by kind only
+    assert "anthropic_api_key" in result.redactions
+    assert not any(FAKE_KEY in r for r in result.redactions)
+
+
+async def test_surrounding_knowledge_survives_redaction():
+    pipeline, graphiti, _, _ = make_recording_pipeline()
+    await pipeline.remember(SECRET_TEXT, project_id="acme-store")
+    stored = graphiti.calls[0]["episode_body"]
+    assert "must be rotated quarterly" in stored, "we redact the secret, not the lesson"
+    assert "ANTHROPIC_API_KEY" in stored, "the key NAME is useful knowledge"
+
+
+async def test_content_hash_is_computed_on_redacted_content():
+    # Otherwise two writes differing only in their (stripped) secret would hash differently
+    # and both be stored, defeating the exact-duplicate guard.
+    pipeline, graphiti, _, _ = make_recording_pipeline()
+    await pipeline.remember(SECRET_TEXT, project_id="acme-store")
+    stored = graphiti.calls[0]["episode_body"]
+    assert _content_hash(stored) == _content_hash(redact(SECRET_TEXT)[0])
+
+
+async def test_clean_content_reports_no_redactions():
+    pipeline, _, _, _ = make_recording_pipeline()
+    result = await pipeline.remember("We chose SQLite for Acme-Store.", project_id="acme-store")
+    assert result.redactions == []
+
+
+async def test_redaction_reported_even_when_write_is_rejected():
+    # A rejected write still altered content; the caller must learn a secret was present
+    # (it means the agent is echoing credentials, regardless of storage outcome).
+    rejected = TriageVerdict(worth_storing=False, knowledge_type="entity", reason="noise")
+    pipeline, _, _, _ = make_recording_pipeline(verdict=rejected)
+    result = await pipeline.remember(SECRET_TEXT, project_id="acme-store")
+    assert result.outcome is Outcome.REJECTED
+    assert "anthropic_api_key" in result.redactions
+
+
+async def test_redaction_reported_on_the_duplicate_path():
+    pipeline, _, _, _ = make_recording_pipeline(
+        nearest=NearestFact(uuid="edge-1", fact="existing", score=0.95)
+    )
+    result = await pipeline.remember(SECRET_TEXT, project_id="acme-store")
+    assert result.outcome is Outcome.DUPLICATE
+    assert "anthropic_api_key" in result.redactions
+
+
+# --- dedup scope override (roadmap item 23) -----------------------------------
+
+
+def test_dedup_scopes_defaults_to_the_write_scope_only():
+    pipeline, _, _, _ = make_recording_pipeline()
+    assert pipeline._dedup_scopes("project_acme-store") == ["project_acme-store"]
+
+
+def test_dedup_scopes_honours_an_explicit_override():
+    pipeline, _, _, _ = make_recording_pipeline()
+    assert pipeline._dedup_scopes("cluster_trading", ["cluster_trading", "global"]) == [
+        "cluster_trading", "global",
+    ]
+    # an empty override is not an override
+    assert pipeline._dedup_scopes("project_x", []) == ["project_x"]
+
+
+class _RecordingIndex:
+    def __init__(self, nearest=None):
+        self._nearest = nearest
+        self.scopes = None
+
+    async def nearest(self, vec, scopes):
+        self.scopes = scopes
+        return self._nearest
+
+
+async def test_widened_dedup_scopes_reach_the_vector_index():
+    graphiti = FakeGraphiti()
+    index = _RecordingIndex()
+    pipeline = WritePipeline(graphiti=graphiti, embedder=FakeEmbedder(), index=index,
+                            triage=FakeTriage(STORABLE), dedup_threshold=0.9, relate_floor=0.75)
+    await pipeline.remember("domain knowledge", cluster="trading",
+                            dedup_scopes=["cluster_trading", "global"])
+    assert index.scopes == ["cluster_trading", "global"]
+
+
+async def test_a_promotion_style_write_is_caught_as_a_duplicate_of_the_wider_tier():
+    # The exact failure from the first real promotion: cluster_trading was empty, but global
+    # already held the knowledge.
+    graphiti = FakeGraphiti()
+    index = _RecordingIndex(NearestFact(uuid="global-edge", fact="already known", score=0.99))
+    pipeline = WritePipeline(graphiti=graphiti, embedder=FakeEmbedder(), index=index,
+                            triage=FakeTriage(STORABLE), dedup_threshold=0.9, relate_floor=0.75)
+    result = await pipeline.remember("already known", cluster="trading",
+                                     dedup_scopes=["cluster_trading", "global"])
+    assert result.outcome is Outcome.DUPLICATE
+    assert result.duplicate_of == "global-edge"
+    assert graphiti.calls == [], "nothing may be stored"
+
+
+# --- global-write gate (research §5.3, roadmap item 15) ------------------------
+# `global` is the one scope composed for EVERY project, and the UserPromptSubmit hook injects it
+# into every prompt — so a project-specific fact there is noise eleven times over. Measured on the
+# live graph: of 137 active global facts, 41 (30%) named exactly one project.
+
+_PROJECT_CLUSTERS = {
+    "acme-sim": "trading", "acme-api": "trading", "acme-data": "trading",
+    "acme-flow": "infra", "acme-bot": "infra",
+    "acme-docs": "creative", "acme-store": "creative",
+    "loner": None,
+}
+
+
+def _gated_pipeline(**kw):
+    graphiti = FakeGraphiti()
+    return WritePipeline(
+        graphiti=graphiti, embedder=FakeEmbedder(), index=FakeIndex(None),
+        triage=FakeTriage(STORABLE), dedup_threshold=0.9, relate_floor=0.75,
+        known_projects=lambda: list(_PROJECT_CLUSTERS),
+        cluster_resolver=_PROJECT_CLUSTERS.get, **kw
+    ), graphiti
+
+
+def test_a_global_write_naming_one_project_is_refiled_to_that_project():
+    pipeline, _ = _gated_pipeline()
+    assert pipeline._better_scope_than_global(
+        "The decision to use ib_async instead of ib_insync applies to the Acme-Sim project"
+    ) == "project_acme-sim"
+
+
+def test_a_global_write_naming_two_projects_in_one_cluster_is_refiled_to_the_cluster():
+    # The measured real case: the SAME knowledge sat in global twice, once per trading project.
+    pipeline, _ = _gated_pipeline()
+    assert pipeline._better_scope_than_global(
+        "The broker historical volume-in-lots gotcha applies to Acme-Sim and Acme-API alike"
+    ) == "cluster_trading"
+
+
+def test_a_write_spanning_clusters_stays_global():
+    pipeline, _ = _gated_pipeline()
+    assert pipeline._better_scope_than_global("acme-flow and acme-docs both run on Kafka") is None
+
+
+def test_a_write_naming_no_project_stays_global():
+    pipeline, _ = _gated_pipeline()
+    assert pipeline._better_scope_than_global(
+        "BigDecimal must be used for monetary values in Java, never double"
+    ) is None
+
+
+def test_a_project_without_a_cluster_cannot_be_refiled_to_one():
+    pipeline, _ = _gated_pipeline()
+    assert pipeline._better_scope_than_global("loner and acme-sim disagree") is None
+
+
+def test_project_names_match_on_word_boundaries_only():
+    # Regression for the actual bug that made this gate a silent no-op: the pattern was written as
+    # rf"\b..." inside a NON-raw string, so \b became a literal backspace (0x08) and the regex
+    # "\x08acme-sim\x08" never matched anything. The gate returned None for every input.
+    pipeline, _ = _gated_pipeline()
+    assert pipeline._better_scope_than_global("Acme-Store uses Firebase") == "project_acme-store"
+    # ...and a name embedded inside a longer word must NOT count.
+    assert pipeline._better_scope_than_global("the forgery detector flags fakes") is None
+
+
+async def test_the_gate_refiles_a_real_write_and_reports_the_redirect():
+    pipeline, graphiti = _gated_pipeline()
+    result = await pipeline.remember(
+        "The ib_async decision applies to the Acme-Sim project", project_id=None,
+    )
+    assert result.scope == "project_acme-sim"
+    assert result.scope_redirected_from == "global"
+    assert "global-write gate" in result.reason
+    assert graphiti.calls[0]["group_id"] == "project_acme-sim"
+
+
+async def test_an_ungated_global_write_is_untouched():
+    pipeline, graphiti = _gated_pipeline()
+    result = await pipeline.remember("BigDecimal for money in Java, never double", project_id=None)
+    assert result.scope == "global"
+    assert result.scope_redirected_from is None
+    assert graphiti.calls[0]["group_id"] == "global"
+
+
+async def test_consolidation_is_trusted_to_write_global_directly():
+    # Promotion reaches global only through a reviewed, evidence-backed proposal — gating it would
+    # fight the mechanism that exists to populate global correctly.
+    pipeline, graphiti = _gated_pipeline()
+    result = await pipeline.remember(
+        "The broker gotcha applies to Acme-Sim and Acme-API", project_id=None, source="consolidation",
+    )
+    assert result.scope == "global"
+    assert result.scope_redirected_from is None
+
+
+async def test_an_explicit_project_write_never_reaches_the_gate():
+    pipeline, graphiti = _gated_pipeline()
+    result = await pipeline.remember("something about Acme-Sim", project_id="acme-api")
+    assert result.scope == "project_acme-api"
+    assert result.scope_redirected_from is None
+
+
+def test_no_resolver_means_no_gating():
+    pipeline, _, _, _ = make_recording_pipeline()
+    assert pipeline._better_scope_than_global("applies to the Acme-Sim project") is None
+
+
+def test_a_broken_registry_never_blocks_a_global_write():
+    def boom():
+        raise RuntimeError("registry unreadable")
+
+    pipeline, _ = _gated_pipeline()
+    pipeline._known_projects = boom
+    assert pipeline._better_scope_than_global("applies to Acme-Sim") is None
+
+
+# --- top-k contradiction adjudication (roadmap item 16) -----------------------
+# Adjudicating only the SINGLE nearest fact meant a write contradicting the second-nearest was
+# never flagged. Measured consequence: 7 Contradicts edges across 3,039 facts.
+
+
+class TopKIndex:
+    """Index that serves a ranked candidate list, like the real Neo4jVectorIndex."""
+
+    def __init__(self, candidates):
+        self._candidates = candidates
+        self.k_asked = None
+
+    async def nearest(self, vec, scopes):
+        return self._candidates[0] if self._candidates else None
+
+    async def nearest_k(self, vec, scopes, k):
+        self.k_asked = k
+        return self._candidates[:k]
+
+
+class ScriptedTriage(FakeTriage):
+    """Returns a verdict per adjudicated fact, so ordering can be asserted."""
+
+    def __init__(self, verdict, by_fact):
+        super().__init__(verdict)
+        self._by_fact = by_fact
+        self.seen: list[str] = []
+
+    async def adjudicate(self, new_content, existing_fact):
+        self.seen.append(existing_fact)
+        return Adjudication(relation=self._by_fact.get(existing_fact, Relation.DISTINCT))
+
+
+def _topk_pipeline(candidates, by_fact, **kw):
+    graphiti = FakeGraphiti()
+    index = TopKIndex(candidates)
+    triage = ScriptedTriage(STORABLE, by_fact)
+    pipeline = WritePipeline(
+        graphiti=graphiti, embedder=FakeEmbedder(), index=index, triage=triage,
+        dedup_threshold=0.9, relate_floor=0.75, **kw
+    )
+    return pipeline, graphiti, index, triage
+
+
+def _c(uuid, fact, score):
+    return NearestFact(uuid=uuid, fact=fact, score=score)
+
+
+async def test_a_contradiction_with_the_second_nearest_fact_is_now_flagged():
+    # The whole point of the item: previously only candidate #1 was ever judged.
+    candidates = [_c("n1", "unrelated but similar wording", 0.86),
+                  _c("n2", "the opposite claim", 0.84)]
+    pipeline, _g, _i, triage = _topk_pipeline(
+        candidates, {"the opposite claim": Relation.CONTRADICTION})
+    result = await pipeline.remember("the new claim", project_id="x")
+    assert result.outcome is Outcome.CONTRADICTION
+    assert result.contradicts == "n2"
+    assert triage.seen == ["unrelated but similar wording", "the opposite claim"]
+
+
+async def test_a_duplicate_anywhere_in_the_band_wins_over_a_contradiction():
+    # Storing a duplicate is worse than missing one contradiction flag.
+    candidates = [_c("n1", "contradicting fact", 0.88), _c("n2", "same thing restated", 0.80)]
+    pipeline, graphiti, _i, _t = _topk_pipeline(candidates, {
+        "contradicting fact": Relation.CONTRADICTION,
+        "same thing restated": Relation.DUPLICATE,
+    })
+    result = await pipeline.remember("new content", project_id="x")
+    assert result.outcome is Outcome.DUPLICATE
+    assert result.duplicate_of == "n2"
+    assert graphiti.calls == [], "a duplicate must not be stored"
+
+
+async def test_the_highest_similarity_contradiction_is_the_one_reported():
+    candidates = [_c("n1", "first contradiction", 0.88), _c("n2", "second contradiction", 0.80)]
+    pipeline, _g, _i, _t = _topk_pipeline(candidates, {
+        "first contradiction": Relation.CONTRADICTION,
+        "second contradiction": Relation.CONTRADICTION,
+    })
+    result = await pipeline.remember("new content", project_id="x")
+    assert result.contradicts == "n1"
+
+
+async def test_adjudication_is_capped_because_each_one_costs_an_llm_call():
+    candidates = [_c(f"n{i}", f"fact {i}", 0.85 - i * 0.01) for i in range(5)]
+    pipeline, _g, _i, triage = _topk_pipeline(candidates, {}, max_adjudications=2)
+    await pipeline.remember("new content", project_id="x")
+    assert len(triage.seen) == 2
+
+
+async def test_candidates_outside_the_gray_band_are_never_adjudicated():
+    # Below relate_floor is unrelated; at/above dedup_threshold is settled deterministically.
+    candidates = [_c("n1", "way below the floor", 0.40), _c("n2", "also below", 0.10)]
+    pipeline, graphiti, _i, triage = _topk_pipeline(candidates, {})
+    result = await pipeline.remember("new content", project_id="x")
+    assert triage.seen == []
+    assert result.outcome is Outcome.STORED and len(graphiti.calls) == 1
+
+
+async def test_a_deterministic_duplicate_short_circuits_before_any_adjudication():
+    candidates = [_c("n1", "near identical", 0.97), _c("n2", "other", 0.80)]
+    pipeline, _g, _i, triage = _topk_pipeline(candidates, {})
+    result = await pipeline.remember("new content", project_id="x")
+    assert result.outcome is Outcome.DUPLICATE and result.duplicate_of == "n1"
+    assert triage.seen == [], "no LLM call needed when cosine already settles it"
+
+
+async def test_the_configured_candidate_width_is_requested():
+    candidates = [_c("n1", "a", 0.80)]
+    pipeline, _g, index, _t = _topk_pipeline(candidates, {}, candidate_k=7)
+    await pipeline.remember("new content", project_id="x")
+    assert index.k_asked == 7
+
+
+async def test_an_index_without_topk_support_degrades_to_the_nearest_fact():
+    # Older builds / unit fakes expose only nearest(); adjudication must still work on top-1.
+    pipeline, _g, _e, triage = make_recording_pipeline(
+        nearest=NearestFact(uuid="n1", fact="the opposite claim", score=0.85))
+    pipeline.triage = ScriptedTriage(STORABLE, {"the opposite claim": Relation.CONTRADICTION})
+    result = await pipeline.remember("new claim", project_id="x")
+    assert result.outcome is Outcome.CONTRADICTION and result.contradicts == "n1"
+
+
+async def test_a_topk_lookup_failure_falls_back_rather_than_failing_the_write():
+    class Exploding(TopKIndex):
+        async def nearest_k(self, vec, scopes, k):
+            raise RuntimeError("index offline")
+
+    graphiti = FakeGraphiti()
+    index = Exploding([_c("n1", "fallback fact", 0.80)])
+    pipeline = WritePipeline(graphiti=graphiti, embedder=FakeEmbedder(), index=index,
+                            triage=FakeTriage(STORABLE), dedup_threshold=0.9, relate_floor=0.75)
+    result = await pipeline.remember("new content", project_id="x")
+    assert result.outcome is Outcome.STORED
+
+
+async def test_a_contradiction_is_persisted_on_the_superseded_fact():
+    # Before this the flag lived only in the write response, which is why the live graph held 7
+    # Contradicts edges against 3,039 facts.
+    class _Driver:
+        def __init__(self):
+            self.calls = []
+
+        async def execute_query(self, query, **params):
+            self.calls.append((query, params))
+
+            class _R:
+                records = []
+
+            return _R()
+
+    class _G:
+        def __init__(self, d):
+            self.driver = d
+
+    driver = _Driver()
+    pipeline = WritePipeline(graphiti=_G(driver), embedder=None, index=None, triage=None)
+    await pipeline._persist_contradiction("ep-1", "old-edge")
+    query, params = next((q, p) for q, p in driver.calls if "contradicted_by" in q)
+    assert params["old"] == "old-edge" and params["ep"] == "ep-1"
+    assert "contradicted_at" in query
+
+
+async def test_persisting_a_contradiction_never_undoes_a_successful_write():
+    class _Boom:
+        async def execute_query(self, query, **params):
+            raise RuntimeError("neo4j down")
+
+    class _G:
+        driver = _Boom()
+
+    pipeline = WritePipeline(graphiti=_G(), embedder=None, index=None, triage=None)
+    await pipeline._persist_contradiction("ep-1", "old-edge")  # must not raise

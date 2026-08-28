@@ -78,7 +78,7 @@ closed.
 
 ## How I know it works
 
-Not because it feels done — because it's measured. There are 649 tests, including
+Not because it feels done — because it's measured. There are 776 tests, including
 invariant tests that assert on the *emitted Cypher* for the temporal guarantees
 (concurrency safety, end-to-end supersession) rather than trusting a design doc.
 Retrieval has an eval harness with negative cases (including a check that one

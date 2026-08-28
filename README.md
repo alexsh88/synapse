@@ -157,6 +157,20 @@ python -m scripts.wire_project my-project
 
 This writes `.mcp.json` and hook stubs into the target project. From then on every Claude Code session in that project can call `remember`, `recall`, and `brief`.
 
+**Then check that it actually works:**
+
+```bash
+python -m scripts.doctor          # every registered project
+python -m scripts.doctor .        # or one folder, no registry needed
+```
+
+Writing the config and being able to run it are different facts, and only the first one is easy to
+check. `doctor` spawns the exact command each `.mcp.json` names, from that project's own folder,
+and completes the MCP handshake — `initialize` → `tools/list`. Claude Code reports a server that
+fails to start as `Failed to reconnect to synapse: -32000` and nothing else; this reports the exit
+code, the stderr, and which of the nine tools came back. Exit status is 1 if any project fails, so
+it can gate a rollout rather than be read by eye.
+
 ---
 
 ## Design decisions
@@ -178,7 +192,7 @@ Deeper engineering notes live in [docs/ENGINEERING.md](docs/ENGINEERING.md).
 
 ## Testing
 
-**649 tests** across unit, contract, and temporal-invariant suites, at 85% line coverage. They run against hand-written
+**776 tests** across unit, contract, and temporal-invariant suites, at 86% line coverage. They run against hand-written
 Protocol fakes — no live Neo4j, Redis, Ollama or Anthropic — so `pytest` is the same command locally
 and in CI. Live-service exercises are separate smoke scripts under `scripts/` (`mcp_smoke.py`,
 `write_smoke.py`, `retrieve_smoke.py`), run by hand against a running stack.
@@ -274,8 +288,8 @@ synapse/
 │       ├── hooks/
 │       ├── lib/                   # API client, WebSocket, Zustand stores
 │       └── types/
-├── tests/                         # 649 tests (unit + contract + temporal-invariant, all fakes)
-├── scripts/                       # run_eval.py, wire_project.py, seed helpers
+├── tests/                         # 776 tests (unit + contract + temporal-invariant, all fakes)
+├── scripts/                       # run_eval.py, wire_project.py, doctor.py, seed helpers
 ├── docs/
 │   ├── architecture/              # schema, write-pipeline, retrieval, mcp-server, api
 │   ├── decisions/                 # ADRs 0001–0006
@@ -294,6 +308,7 @@ synapse/
 - **Embedding dimension locked at first ingestion** — BGE-M3 produces 1024-dimensional vectors; this is set in the Neo4j vector index schema on first write. Changing the dimension requires dropping the index and re-embedding the entire corpus.
 - **Local extraction drops ~14% of dense facts** — gemma3:12b in `local` mode silently misses roughly 14% of complex, information-dense writes compared to Claude Sonnet 4.6. These are detected by the write pipeline's structural validator and moved to the review queue rather than dropped silently, but they do require manual review.
 - **Desktop-first UI** — the graph explorer requires a real screen to be useful. Mobile layout does not break, but it is not the design target.
+- **The Projects page still reports wiring, not health** — its "connected" badge is derived from the presence of `.mcp.json`, which is the check that stayed green while nine of eleven servers were dead. `python -m scripts.doctor` is the truthful answer; the page is not, because a handshake takes 10-20s per project and cannot run inside a page load. Making the badge honest needs a background job and a cached result.
 - **Eval golden set is small, and it is not held out** — 52 private cases (15 in the public demo set) covering positive, negative, and cross-project categories. Two separate limits follow. It is too small for statistical confidence in absolute metric comparisons, so the numbers above carry no confidence interval. And it has been used during tuning, so it measures regression, not generalisation — treat it as a gate, not a score.
 
 ---

@@ -69,6 +69,14 @@ synapse/eval/heldout.json
 invalidation-labels*.md
 invalidation-labels*.key.json
 
+# Scratch explainers and one-off analyses kept beside the repo rather than in it. The sibling
+# synapse-system-design.html is already ignored above for the same reason. measure_cost.py is
+# superseded by scripts/cost_report.py, which reads the real ledger instead of estimating — kept
+# here only so nothing is deleted out from under you; bin it whenever.
+measure_cost.py
+synapse-explained-simply.html
+synapse-system-design-notebooklm.md
+
 # Career / positioning notes. These are about the AUTHOR, not the software, and a repository that
 # ships its own resume bullets reads as a project built to serve a CV rather than the reverse. The
 # comment draft is the pointed one: it reasons about how to pitch a contribution inside another

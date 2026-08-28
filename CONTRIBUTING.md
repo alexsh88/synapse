@@ -16,7 +16,7 @@ Run tests:
 pytest tests/ -v
 ```
 
-All 649 tests run against Protocol fakes — no live Neo4j, Redis, Ollama or Anthropic needed, which
+All 776 tests run against Protocol fakes — no live Neo4j, Redis, Ollama or Anthropic needed, which
 is why CI runs the same bare `pytest`. If a test ever needs a live service, it belongs in
 `scripts/*_smoke.py` instead, which you run by hand against a started stack:
 

@@ -16,22 +16,33 @@ It also differs from raw graph databases: Graphiti handles entity resolution, te
 
 ## What operating it found
 
-Running this against eleven real projects surfaced a defect in Graphiti itself: its edge-invalidation
-candidate search is unscoped, so an ordinary write silently retires unrelated facts that are still
-true. No error, no warning — the fact just stops appearing in search results.
+Running Synapse against eleven real projects surfaced a defect in **Graphiti**, the graph engine
+underneath it. Graphiti's edge-invalidation candidate search is unscoped, so writing one fact could
+silently retire unrelated facts that were still true — no error, no warning, the write reports
+success, and the fact simply stops appearing in search results.
 
-**Measured on this corpus: 70% of automatically-retired facts were still true** (28 of 40
-hand-labelled cases, 95% CI [54.6%, 81.9%]). A separate structural method put it at 75.6%, inside
-that interval — two methods sharing no mechanism, agreeing.
+It was measured, not estimated. On a corpus of 4,651 edges carrying 526 automatic retirements, a
+stratified sample of 40 was hand-labelled blind: **28 were wrong retirements — 70%, 95% CI [54.6%,
+81.9%]**. An independent structural method put it at 75.6%, inside that interval; two methods
+sharing no mechanism, agreeing.
+
+**That figure describes Graphiti's default behaviour, not Synapse's current behaviour.** The guard
+ships here (`_revert_unjustified_invalidations`): against those same 40 labelled cases it takes
+silent losses of true facts from 28 to **zero**, at the cost of keeping 11 stale ones. The trade is
+deliberate — a stale fact is recoverable from the review queue, a silently deleted one is not — and
+five candidate rules were scored by error *type* rather than by accuracy before this one was chosen.
 
 The write-up is the most interesting thing in this repository, and it includes the two measurements
-that turned out to be wrong: **[docs/FINDING-silent-fact-loss.md](docs/FINDING-silent-fact-loss.md)**.
-Reproduce it with `scripts/audit_invalidations.py`, `scripts/validate_invalidation_guard.py` and
+that turned out to be wrong — one of them circular, caught and retracted rather than published:
+**[docs/FINDING-silent-fact-loss.md](docs/FINDING-silent-fact-loss.md)**. Reproduce it with
+`scripts/audit_invalidations.py`, `scripts/validate_invalidation_guard.py` and
 `scripts/compare_guard_variants.py`.
 
-The mitigation ships here (`_revert_unjustified_invalidations`); the real fix belongs upstream in the
-candidate search, which is what [getzep/graphiti#1729](https://github.com/getzep/graphiti/pull/1729)
-proposes.
+The real fix belongs upstream in the candidate search, not in a downstream veto:
+[issue #1728](https://github.com/getzep/graphiti/issues/1728) reports it,
+[PR #1729](https://github.com/getzep/graphiti/pull/1729) proposes the fix, and the measurements above
+were [contributed to that thread](https://github.com/getzep/graphiti/issues/1728#issuecomment-5357647737).
+Both are still open upstream.
 
 ---
 
